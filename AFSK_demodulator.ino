@@ -119,6 +119,7 @@ int fftDecide() {
 
 const int SAMPLES_PER_BIT = (int)(SAMPLE_RATE / BAUD_RATE);  // 147
 int  clockCounter  = 0;       // counts samples within current bit window
+int  lastSoft     = -1;
 int  lastDecision  = -1;      // previous per-sample decision
 int  lastBit       = -1;      // last committed bit output
 
@@ -137,27 +138,23 @@ int clockRecovery(int softBit) {
   // 1, we know the mid phase of bit
   // 2, bit is recovered at the mid phase
   // 
-   real signal:   | edge ---- midpoint ---- edge |
-                ↑ aligned here
-  within the 
-  // draw a softBit If the bit edge (transition) is aligned with the counter center, 
-  // the bit mid is aligned to the counter edge, where clockCounter == SAMPLES_PER_BIT 
-  if (lastDecision != -1 && softBit != lastDecision) {
-  
-    // Pull clock counter toward SAMPLES_PER_BIT/2 (midpoint)
+  // Edge nudge — only when a fresh soft decision just arrived
+  if (softBit != -1 && lastSoft != -1 && softBit != lastSoft) {
     int mid = SAMPLES_PER_BIT / 2;
     if (clockCounter < mid)
       clockCounter += 2;   // we're early → slow down slightly
     else
       clockCounter -= 2;   // we're late  → speed up slightly
+    lastSoft = softBit;
   }
-  lastDecision = softBit;
+  if (softBit != -1) lastSoft = softBit;
 
-  // Sample at midpoint of bit window (most reliable point)
+  // Always advance by 1 sample — this is the key fix
   clockCounter++;
   if (clockCounter >= SAMPLES_PER_BIT) {
     clockCounter = 0;
-    committed = softBit;   // commit the decision at window center
+    // Commit whatever the most recent soft decision was
+    if (lastSoft != -1) committed = lastSoft;
   }
 
   return committed;
@@ -226,13 +223,12 @@ void loop() {
         fftHopCount = 0;
         softBit = fftDecide();
       }
+      // softBit stays -1 for the other HOP-1 samples
     }
-
-    // Clock recovery + bit commit
-    if (softBit != -1) {
-      int committed = clockRecovery(softBit);
-      if (committed != -1) emitBit(committed);
-    }
+  
+    // Clock advances every sample regardless
+    int committed = clockRecovery(softBit);
+    if (committed != -1) emitBit(committed);
   }
 
   queue1.freeBuffer();
