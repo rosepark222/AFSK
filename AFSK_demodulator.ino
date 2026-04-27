@@ -8,15 +8,27 @@ const DemodMethod DEMOD_SELECT = DEMOD_GOERTZEL_IIR;
 // ─── AFSK Parameters ─────────────────────────────────────────────────────────
 #define FREQ_MARK   6000.0f
 #define FREQ_SPACE  8000.0f
-#define BAUD_RATE   300
+#define BAUD_RATE   10
 #define SAMPLE_RATE 44100.0f
 #define FFT_N       256
+
+
+// ─── Non-blocking bit output buffer ──────────────────────────────────────────
+#define BIT_BUF_SIZE 256
+volatile uint8_t bitBuf[BIT_BUF_SIZE];
+volatile int     bitBufHead = 0;
+volatile int     bitBufTail = 0;
+
+#define EXPECTED_BITS 32
+uint8_t  collectedBits[EXPECTED_BITS];
+int      collectedCount = 0;
+bool     bufferFull     = false;
 
 // ─── LPF Cutoff ───────────────────────────────────────────────────────────────
 // Cutoff should be around 0.5 * baud_rate to pass the envelope, reject carrier.
 // LPF alpha for single-pole IIR:  alpha = 1 - exp(-2π·fc/fs)
 // fc = 150 Hz (half baud), fs = 44100
-#define LPF_FC      150.0f
+#define LPF_FC      2*BAUD_RATE // 600.0f   // try 2× baud rate first, then tune down
 const float LPF_ALPHA = 1.0f - expf(-2.0f * PI * LPF_FC / SAMPLE_RATE);  // ≈ 0.0213
 
 // ─── Audio Objects ────────────────────────────────────────────────────────────
@@ -160,11 +172,61 @@ int clockRecovery(int softBit) {
   return committed;
 }
 
+// Called from audio loop — just stores
+void emitBit_fixedBuffer(int bit) {
+  if (collectedCount < EXPECTED_BITS) {
+    collectedBits[collectedCount++] = bit;
+    if (collectedCount == EXPECTED_BITS)
+      bufferFull = true;
+  }
+}
+
+// Called from loop() — prints and resets when buffer is full
+void drainBitBuffer_fixedBuffer() {
+  if (!bufferFull) return;
+
+  // Print all 24 bits
+  Serial.print("RX: ");
+  for (int i = 0; i < EXPECTED_BITS; i++) {
+    Serial.print(collectedBits[i]);
+    if ((i + 1) % 8 == 0) Serial.print(' ');  // space every byte
+  }
+  Serial.println();
+
+  // Reset for next burst
+  collectedCount = 0;
+  bufferFull     = false;
+}
+
+
+
+// Called from audio loop — just enqueues, never blocks
+void emitBit_ring(int bit) {
+  int next = (bitBufHead + 1) % BIT_BUF_SIZE;
+  if (next != bitBufTail)  // drop if full
+    bitBuf[bitBufHead] = bit;
+    bitBufHead = next;
+}
+
+// Called from loop() — drains buffer and prints, outside audio processing
+void drainBitBuffer() {
+  static int count = 0;
+  while (bitBufTail != bitBufHead) {
+    Serial.print(bitBuf[bitBufTail]);
+    bitBufTail = (bitBufTail + 1) % BIT_BUF_SIZE;
+    if (++count % 64 == 0) Serial.println();
+  }
+}
+
 // ─── Bit stream printer ────────────────────────────────────────────────────
 int  bitCount = 0;
 char bitLine[9];
-
 void emitBit(int bit) {
+  Serial.print(bit);
+  if (++bitCount % 100 == 0) Serial.println();
+}
+
+void emitBit_toomuch(int bit) {
   Serial.print(bit);
   bitLine[bitCount++] = '0' + bit;
   if (bitCount == 8) {
@@ -180,6 +242,7 @@ void emitBit(int bit) {
 
 // ─── Setup ────────────────────────────────────────────────────────────────────
 void setup() {
+  Serial.println("_START");
   Serial.begin(115200);
   while (!Serial && millis() < 3000);
 
@@ -197,8 +260,74 @@ void setup() {
   Serial.printf("AFSK Demod | %s | LPF_alpha=%.4f | SPB=%d\n", m, LPF_ALPHA, SAMPLES_PER_BIT);
 }
 
-// ─── Loop ─────────────────────────────────────────────────────────────────────
+void loop_fixedBuffer() {
+  if (queue1.available()) {
+    int16_t* block = queue1.readBuffer();
+    for (int i = 0; i < 128; i++) {
+      float x = block[i] / 32768.0f;
+
+      int softBit = -1;
+      if (DEMOD_SELECT == DEMOD_GOERTZEL_IIR) {
+        float em = markDet.process(x);
+        float es = spaceDet.process(x);
+        softBit = (em > es) ? 1 : 0;
+      } else {
+        fftRingBuf[fftRingHead] = x;
+        fftRingHead = (fftRingHead + 1) % FFT_N;
+        if (++fftHopCount >= FFT_HOP) {
+          fftHopCount = 0;
+          softBit = fftDecide();
+        }
+      }
+
+      int committed = clockRecovery(softBit);
+      if (committed != -1) emitBit(committed);
+    }
+    queue1.freeBuffer();
+  }
+
+  drainBitBuffer();
+}
+
 void loop() {
+  // Audio processing — fast, no Serial
+  if (queue1.available()) {
+    int16_t* block = queue1.readBuffer();
+    for (int i = 0; i < 128; i++) {
+      float x = block[i] / 32768.0f;
+
+    int softBit = -1;
+
+    if (DEMOD_SELECT == DEMOD_GOERTZEL_IIR) {
+      // ── Per-sample IQ envelope (your guideline) ───────────────────────────
+      float em = markDet.process(x);
+      float es = spaceDet.process(x);
+      softBit = (em > es) ? 1 : 0;
+
+    } else {
+      // ── Sliding FFT (hop-based) ───────────────────────────────────────────
+      fftRingBuf[fftRingHead] = x;
+      fftRingHead = (fftRingHead + 1) % FFT_N;
+      fftHopCount++;
+      if (fftHopCount >= FFT_HOP) {
+        fftHopCount = 0;
+        softBit = fftDecide();
+      }
+      // softBit stays -1 for the other HOP-1 samples
+    }
+
+      int committed = clockRecovery(softBit);
+      if (committed != -1) emitBit(committed);  // non-blocking
+    }
+    queue1.freeBuffer();
+  }
+
+  // Serial printing — runs whenever CPU is idle between audio blocks
+  //drainBitBuffer();
+}
+
+
+void loop_buggy() {
   if (!queue1.available()) return;
 
   int16_t* block = queue1.readBuffer();

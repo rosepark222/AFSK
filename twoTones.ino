@@ -1,4 +1,64 @@
 
+
+/*
+
+TODO: fix Cumulative Timing Error (or cumulative drift)
+Zero Drift: The IntervalTimer uses dedicated hardware clocks. It will trigger your ISR at the exact microsecond requested, regardless of code execution jitter.
+Non-Blocking: Your loop() is now empty and runs at full speed. You can read sensors, update a screen, or process Serial commands while the FSK burst plays in the background.
+Stability: By removing the while(micros() < nextBitTime) loop, you eliminate the risk of the CPU hanging if the timing logic overflows or gets stuck. 
+ 
+#include <Audio.h>
+#include <IntervalTimer.h>
+
+IntervalTimer bitTimer;
+volatile bool isTransmitting = false;
+volatile int currentBitIndex = 0;
+const int TOTAL_BITS = 64; // bitCount * 8
+
+void sendBitISR() {
+  if (currentBitIndex < TOTAL_BITS) {
+    // Alternating 0 and 1 for testing; replace with your data array
+    int bit = currentBitIndex % 2; 
+    
+    if (bit == 1) fskOsc.frequency(FREQ_MARK);
+    else fskOsc.frequency(FREQ_SPACE);
+    
+    currentBitIndex++;
+  } else {
+    // Burst finished: cleanup
+    fskOsc.amplitude(0.0);
+    isTransmitting = false;
+    bitTimer.end(); // Stop the timer until next burst
+  }
+}
+
+void startBurst() {
+  if (isTransmitting) return; // Don't start if already running
+  
+  currentBitIndex = 0;
+  isTransmitting = true;
+  fskOsc.amplitude(0.5);
+  
+  // Start the timer to call sendBitISR every BIT_PERIOD (in microseconds)
+  bitTimer.begin(sendBitISR, BIT_PERIOD);
+  bitTimer.priority(200); // Lower priority than Audio Library to prevent clicks
+}
+
+elapsedMillis sinceLastBurst;
+
+void loop() {
+  // Trigger a burst every 5 seconds without blocking
+  if (sinceLastBurst >= 5000) {
+    sinceLastBurst = 0;
+    Serial.println("Starting burst...");
+    startBurst();
+  }
+
+  // You can now run other code here freely!
+}
+
+Do you need help storing your data bits in an array so the ISR can read them instead of just alternating 0 and 1?
+*/
 #include <Audio.h>
 
 // Audio Objects
@@ -17,7 +77,7 @@ AudioConnection      patchCord2(fskOsc, 0, i2s1, 1);
 #define FREQ_MARK  6000  // Binary 1
 #define FREQ_SPACE 8000  // Binary 0
 
-#define BAUD_RATE   300 // 1200  // Bits per second
+#define BAUD_RATE   10 // 1200  // Bits per second
 #define BIT_PERIOD (1000000 / BAUD_RATE)  
 
 void setup() {
@@ -29,11 +89,67 @@ void setup() {
   Serial.println("Bell 202 FSK: Sending 01010101 Pattern");
 }
 
+uint32_t nextBitTime = 0;
 void sendBit(int bit) {
-  // Switch frequency based on bit
+  if (nextBitTime == 0) {
+    nextBitTime = micros();
+    return;
+  }
+
+  if (bit == 1) fskOsc.frequency(FREQ_MARK);
+  else          fskOsc.frequency(FREQ_SPACE);
+
+  nextBitTime += BIT_PERIOD;
+  while (micros() < nextBitTime);
+}
+
+void sendBit_buggyprint(int bit) {
+  if (nextBitTime == 0) {
+    nextBitTime = micros();
+    return;  // first call just initializes — don't send yet
+  }
+
+  // How late are we arriving at this bit's deadline?
+  int32_t lag = (int32_t)(micros() - nextBitTime);  // should be 0..few us
+
+  if (bit == 1) fskOsc.frequency(FREQ_MARK);
+  else          fskOsc.frequency(FREQ_SPACE);
+
+  nextBitTime += BIT_PERIOD;
+  while (micros() < nextBitTime);
+
+  // Print lag at entry — not drift at exit
+  static int diagCount = 0;
+  if (++diagCount % 100 == 0) {
+    Serial.printf("entry lag: %+d us\n", lag);
+  }
+}
+
+void sendBit_new_idea(int bit) {
+  // First call: initialize the timeline
+  if (nextBitTime == 0) nextBitTime = micros();
+
+  // Switch frequency immediately
   if (bit == 1) {
     fskOsc.frequency(FREQ_MARK);
   } else {
+    fskOsc.frequency(FREQ_SPACE);
+  }
+
+  // Wait until the absolute deadline — not a relative delay
+  nextBitTime += BIT_PERIOD;
+  while (micros() < nextBitTime);
+}
+
+void sendBit_buggyone(int bit) {
+  // Switch frequency based on bit
+  if (bit == 1) {
+    fskOsc.frequency(FREQ_MARK);
+     //fskOsc.frequency(FREQ_SPACE);
+
+  } else {
+    //    fskOsc.frequency(FREQ_MARK);
+
     fskOsc.frequency(FREQ_SPACE);
   }
   
@@ -41,228 +157,47 @@ void sendBit(int bit) {
   delayMicroseconds(BIT_PERIOD);
 }
 
-void loop() {
-  // Send a 10-bit pattern of alternating 0s and 1s
-  for (int i = 0; i < 10; i++) {
+int bitCount = 4; // 3 bytes
+void loop_loop() {
+  // Get current time in milliseconds
+  unsigned long currentTime = millis();
+  
+  // Print the time
+  Serial.print("Current Time (ms): ");
+  Serial.println(currentTime);
+  
+  // Delay for 5000 milliseconds (5 seconds)
+  delay(5000);
+}
+
+void loop_5secdelay() {
+  unsigned long currentTime = millis();
+  Serial.print("Current Time (ms): ");
+  Serial.println(currentTime);
+
+  fskOsc.amplitude(0.1);
+  nextBitTime = 0;           // ← reset before every burst
+  for (int i = 0; i < bitCount*8; i++) {
     int currentBit = i % 2; // Alternates 0, 1, 0, 1...
     sendBit(currentBit);
   }
   
   // Optional: Long Mark (1) between bursts to stabilize receiver
   //fskOsc.frequency(FREQ_MARK);
-  //delay(100); 
+  fskOsc.amplitude(0.0);  // turn off
+  delay(5000); // 5 second
 }
 
-// #include <Audio.h>
 
-// AudioSynthWaveform osc;
-// AudioEffectEnvelope env;
-// AudioOutputI2S i2s1;
-
-// AudioConnection patchCord1(osc, env);
-// AudioConnection patchCord2(env, 0, i2s1, 0);
-// AudioConnection patchCord3(env, 0, i2s1, 1);
-
-// // Notes
-// #define E7 2637
-// #define C7 2093
-// #define G7 3136
-// #define G6 1568
-// #define E6 1319
-// #define A6 1760
-// #define B6 1976
-// #define AS6 1865
-// #define F7 2794
-// #define D7 2349
-
-// void setup() {
-//   AudioMemory(12);
-
-//   osc.begin(WAVEFORM_SQUARE); // classic game sound
-//   osc.amplitude(0.1);
-
-//   env.attack(2);
-//   env.decay(80);
-//   env.sustain(0.0);
-//   env.release(20);
-// }
-
-
-
-// void play(int freq, int duration) {
-//   if (freq > 0) {
-//     osc.frequency(freq);
-//     env.noteOn();
-//   }
-
-//   delay(duration);
-
-//   env.noteOff();
-//   delay(duration * 0.3);
-// }
-
-// void loop() {
-
-//   // Main theme (iconic opening)
-//   play(E7, 150);
-//   play(E7, 150);
-//   delay(150);
-
-//   play(E7, 150);
-//   delay(150);
-
-//   play(C7, 150);
-//   play(E7, 150);
-//   delay(150);
-
-//   play(G7, 300);
-//   delay(300);
-
-//   play(G6, 300);
-//   delay(300);
-
-//   // Phrase 2
-//   play(C7, 200);
-//   delay(150);
-
-//   play(G6, 200);
-//   delay(150);
-
-//   play(E6, 200);
-//   delay(150);
-
-//   play(A6, 150);
-//   play(B6, 150);
-//   play(AS6, 150);
-//   play(A6, 150);
-
-//   play(G6, 200);
-//   play(E7, 200);
-//   play(G7, 200);
-//   play(A7, 150);
-
-//   play(F7, 150);
-//   play(G7, 150);
-
-//   delay(300);
-
-//   play(E7, 150);
-//   play(C7, 150);
-//   play(D7, 150);
-//   play(B6, 300);
-
-//   delay(2000); // loop pause
-// }
-
-
-
-// // #include <Audio.h>
-
-// // AudioSynthWaveform osc;
-// // AudioEffectEnvelope env;
-// // AudioOutputI2S i2s1;
-
-// // AudioConnection patchCord1(osc, env);
-// // AudioConnection patchCord2(env, 0, i2s1, 0);
-// // AudioConnection patchCord3(env, 0, i2s1, 1);
-
-// // // Notes
-// // #define E7 2637
-// // #define C7 2093
-// // #define G7 3136
-// // #define G6 1568
-// // #define E6 1319
-// // #define A6 1760
-// // #define B6 1976
-// // #define AS6 1865
-// // #define F7 2794
-// // #define D7 2349
-// // #define A7 3520
-
-
-// // void setup_better() {
-// //   Serial.begin(115200);
-
-// //   AudioMemory(12);
-
-// //   osc.begin(WAVEFORM_SQUARE);
-// //   osc.amplitude(0.5);
-
-// //   env.attack(2);
-// //   env.decay(80);
-// //   env.sustain(0.0);
-// //   env.release(20);
-
-// //   delay(1000); // give Serial time to start
-// // }
-
-// // void play_better(int freq, const char* name, int duration) {
-// //   if (freq > 0) {
-// //     Serial.print("Playing: ");
-// //     Serial.print(name);
-// //     Serial.print(" (");
-// //     Serial.print(freq);
-// //     Serial.println(" Hz)");
-
-// //     osc.frequency(freq);
-// //     env.noteOn();
-// //   } else {
-// //     Serial.println("Rest");
-// //   }
-
-// //   delay(duration);
-
-// //   env.noteOff();
-// //   delay(duration * 0.3);
-// // }
-
-// // void loop_better() {
-
-// //   play_better(E7, "E7", 150);
-// //   play_better(E7, "E7", 150);
-// //   delay(150);
-
-// //   play_better(E7, "E7", 150);
-// //   delay(150);
-
-// //   play_better(C7, "C7", 150);
-// //   play_better(E7, "E7", 150);
-// //   delay(150);
-
-// //   play_better(G7, "G7", 300);
-// //   delay(300);
-
-// //   play_better(G6, "G6", 300);
-// //   delay(300);
-
-// //   play_better(C7, "C7", 200);
-// //   delay(150);
-
-// //   play_better(G6, "G6", 200);
-// //   delay(150);
-
-// //   play_better(E6, "E6", 200);
-// //   delay(150);
-
-// //   play_better(A6, "A6", 150);
-// //   play_better(B6, "B6", 150);
-// //   play_better(AS6, "A#6", 150);
-// //   play_better(A6, "A6", 150);
-
-// //   play_better(G6, "G6", 200);
-// //   play_better(E7, "E7", 200);
-// //   play_better(G7, "G7", 200);
-// //   play_better(A7, "A7", 150);
-
-// //   play_better(F7, "F7", 150);
-// //   play_better(G7, "G7", 150);
-
-// //   delay(300);
-
-// //   play_better(E7, "E7", 150);
-// //   play_better(C7, "C7", 150);
-// //   play_better(D7, "D7", 150);
-// //   play_better(B6, "B6", 300);
-
-// //   delay(2000);
-// // }
+void loop() {
+ 
+  for (int i = 0; i < bitCount*8; i++) {
+    int currentBit = i % 2; // Alternates 0, 1, 0, 1...
+    sendBit(currentBit);
+  }
+  
+  // Optional: Long Mark (1) between bursts to stabilize receiver
+  //fskOsc.frequency(FREQ_MARK);
+  //fskOsc.amplitude(0.0);  // turn off
+  //delay(5000); // 5 second
+}
