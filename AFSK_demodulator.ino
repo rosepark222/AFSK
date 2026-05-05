@@ -6,28 +6,17 @@ enum DemodMethod { DEMOD_GOERTZEL_IIR, DEMOD_FFT_SLIDING };
 const DemodMethod DEMOD_SELECT = DEMOD_GOERTZEL_IIR;
 
 // ─── AFSK Parameters ─────────────────────────────────────────────────────────
-#define FREQ_MARK   6000.0f
-#define FREQ_SPACE  8000.0f
-#define BAUD_RATE   10
+//#define FREQ_MARK   6000.0f
+//#define FREQ_SPACE  8000.0f
+
+#define FREQ_MARK   15000.0f
+#define FREQ_SPACE  17000.0f
+
+#define BAUD_RATE   100
 #define SAMPLE_RATE 44100.0f
 #define FFT_N       256
-
-
-// ─── Non-blocking bit output buffer ──────────────────────────────────────────
-#define BIT_BUF_SIZE 256
-volatile uint8_t bitBuf[BIT_BUF_SIZE];
-volatile int     bitBufHead = 0;
-volatile int     bitBufTail = 0;
-
-#define EXPECTED_BITS 32
-uint8_t  collectedBits[EXPECTED_BITS];
-int      collectedCount = 0;
-bool     bufferFull     = false;
-
-// ─── LPF Cutoff ───────────────────────────────────────────────────────────────
-// Cutoff should be around 0.5 * baud_rate to pass the envelope, reject carrier.
-// LPF alpha for single-pole IIR:  alpha = 1 - exp(-2π·fc/fs)
-// fc = 150 Hz (half baud), fs = 44100
+ 
+ 
 #define LPF_FC      2*BAUD_RATE // 600.0f   // try 2× baud rate first, then tune down
 const float LPF_ALPHA = 1.0f - expf(-2.0f * PI * LPF_FC / SAMPLE_RATE);  // ≈ 0.0213
 
@@ -35,18 +24,7 @@ const float LPF_ALPHA = 1.0f - expf(-2.0f * PI * LPF_FC / SAMPLE_RATE);  // ≈ 
 AudioInputI2S     i2s_in;
 AudioRecordQueue  queue1;
 AudioConnection   patchCord1(i2s_in, 0, queue1, 0);
-
-// ═════════════════════════════════════════════════════════════════════════════
-//  METHOD A: Per-sample IQ envelope — Goertzel as a running IIR correlator
-//  
-//  Math:
-//    I_mark[n]  = x[n]·cos(2π·f_mark·n/fs)   ──► LPF ──► I_m
-//    Q_mark[n]  = x[n]·sin(2π·f_mark·n/fs)   ──► LPF ──► Q_m
-//    E_mark[n]  = I_m² + Q_m²
-//
-//    Same for space. decision = E_mark > E_space
-// ═════════════════════════════════════════════════════════════════════════════
-
+ 
 struct IQDetector {
   float phaseInc;   // 2π·f/fs
   float phase;      // running phase accumulator
@@ -82,13 +60,7 @@ struct IQDetector {
 };
 
 IQDetector markDet, spaceDet;
-
-// ═════════════════════════════════════════════════════════════════════════════
-//  METHOD B: Sliding-window FFT (overlapping blocks, hop = 1 sample)
-//  Full overlap is expensive — instead use hop = FFT_N/4 as a compromise.
-//  Gives 4 decisions per FFT_N samples (much denser than block mode).
-// ═════════════════════════════════════════════════════════════════════════════
-
+ 
 float fftRingBuf[FFT_N];
 int   fftRingHead = 0;
 int   fftHopCount = 0;
@@ -105,52 +77,25 @@ void buildHann() {
 
 int freqToBin(float f) { return (int)(f * FFT_N / SAMPLE_RATE + 0.5f); }
 
-int fftDecide() {
-  // Copy ring buffer in order into fftIn[], apply window
-  for (int i = 0; i < FFT_N; i++) {
-    int idx = (fftRingHead + i) % FFT_N;
-    fftIn[i] = fftRingBuf[idx] * hanWin[i];
-  }
-  arm_rfft_fast_f32(&fftInst, fftIn, fftOut, 0);
-
-  // Magnitude at target bins (sum ±1 neighbor)
-  auto mag = [&](int bin) -> float {
-    float re = fftOut[2*bin], im = fftOut[2*bin+1];
-    return re*re + im*im;  // squared magnitude, skip sqrt
-  };
-  int mb = freqToBin(FREQ_MARK), sb = freqToBin(FREQ_SPACE);
-  float em = mag(mb-1)+mag(mb)+mag(mb+1);
-  float es = mag(sb-1)+mag(sb)+mag(sb+1);
-  return (em > es) ? 1 : 0;
-}
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  Clock Recovery — simple early/late gate on the soft-decision stream
 //  Detects transitions in the decision signal and realigns the sample clock.
 // ═════════════════════════════════════════════════════════════════════════════
 
-const int SAMPLES_PER_BIT = (int)(SAMPLE_RATE / BAUD_RATE);  // 147
+const int SAMPLES_PER_BIT = (int)(SAMPLE_RATE / BAUD_RATE);
+const int mid = SAMPLES_PER_BIT / 2;
 int  clockCounter  = 0;       // counts samples within current bit window
 int  lastSoft     = -1;
 int  lastDecision  = -1;      // previous per-sample decision
 int  lastBit       = -1;      // last committed bit output
 
+
 // Call every sample with the current soft decision (0 or 1).
 // Returns committed bit when clock fires, -1 otherwise.
 int clockRecovery(int softBit) {
   int committed = -1;
-
-  // Edge detected → nudge clock toward center of symbol
-  // The logic is this. 
-  // clockRecovery is called everytime softBit is calculated 
-  // softBit are transitioning between 1 and 0 as : 1111 0000 11111 0000 
-  // clockCounter is bit phase indicating the relative position within a bit
-  // clockCounter:   0 -------- 73 -------- 147
-  // The goal is to lock the bit phase to the softBit transition, so that 
-  // 1, we know the mid phase of bit
-  // 2, bit is recovered at the mid phase
-  // 
-  // Edge nudge — only when a fresh soft decision just arrived
+ 
   if (softBit != -1 && lastSoft != -1 && softBit != lastSoft) {
     int mid = SAMPLES_PER_BIT / 2;
     if (clockCounter < mid)
@@ -168,76 +113,15 @@ int clockRecovery(int softBit) {
     // Commit whatever the most recent soft decision was
     if (lastSoft != -1) committed = lastSoft;
   }
-
   return committed;
 }
-
-// Called from audio loop — just stores
-void emitBit_fixedBuffer(int bit) {
-  if (collectedCount < EXPECTED_BITS) {
-    collectedBits[collectedCount++] = bit;
-    if (collectedCount == EXPECTED_BITS)
-      bufferFull = true;
-  }
-}
-
-// Called from loop() — prints and resets when buffer is full
-void drainBitBuffer_fixedBuffer() {
-  if (!bufferFull) return;
-
-  // Print all 24 bits
-  Serial.print("RX: ");
-  for (int i = 0; i < EXPECTED_BITS; i++) {
-    Serial.print(collectedBits[i]);
-    if ((i + 1) % 8 == 0) Serial.print(' ');  // space every byte
-  }
-  Serial.println();
-
-  // Reset for next burst
-  collectedCount = 0;
-  bufferFull     = false;
-}
-
-
-
-// Called from audio loop — just enqueues, never blocks
-void emitBit_ring(int bit) {
-  int next = (bitBufHead + 1) % BIT_BUF_SIZE;
-  if (next != bitBufTail)  // drop if full
-    bitBuf[bitBufHead] = bit;
-    bitBufHead = next;
-}
-
-// Called from loop() — drains buffer and prints, outside audio processing
-void drainBitBuffer() {
-  static int count = 0;
-  while (bitBufTail != bitBufHead) {
-    Serial.print(bitBuf[bitBufTail]);
-    bitBufTail = (bitBufTail + 1) % BIT_BUF_SIZE;
-    if (++count % 64 == 0) Serial.println();
-  }
-}
-
+ 
 // ─── Bit stream printer ────────────────────────────────────────────────────
 int  bitCount = 0;
 char bitLine[9];
 void emitBit(int bit) {
   Serial.print(bit);
   if (++bitCount % 100 == 0) Serial.println();
-}
-
-void emitBit_toomuch(int bit) {
-  Serial.print(bit);
-  bitLine[bitCount++] = '0' + bit;
-  if (bitCount == 8) {
-    bitLine[8] = '\0';
-    // Decode byte value too
-    uint8_t byteVal = 0;
-    for (int i = 0; i < 8; i++)
-      if (bitLine[i] == '1') byteVal |= (1 << (7 - i));
-    Serial.printf("  [%s] = 0x%02X\n", bitLine, byteVal);
-    bitCount = 0;
-  }
 }
 
 // ─── Setup ────────────────────────────────────────────────────────────────────
@@ -260,35 +144,9 @@ void setup() {
   Serial.printf("AFSK Demod | %s | LPF_alpha=%.4f | SPB=%d\n", m, LPF_ALPHA, SAMPLES_PER_BIT);
 }
 
-void loop_fixedBuffer() {
-  if (queue1.available()) {
-    int16_t* block = queue1.readBuffer();
-    for (int i = 0; i < 128; i++) {
-      float x = block[i] / 32768.0f;
-
-      int softBit = -1;
-      if (DEMOD_SELECT == DEMOD_GOERTZEL_IIR) {
-        float em = markDet.process(x);
-        float es = spaceDet.process(x);
-        softBit = (em > es) ? 1 : 0;
-      } else {
-        fftRingBuf[fftRingHead] = x;
-        fftRingHead = (fftRingHead + 1) % FFT_N;
-        if (++fftHopCount >= FFT_HOP) {
-          fftHopCount = 0;
-          softBit = fftDecide();
-        }
-      }
-
-      int committed = clockRecovery(softBit);
-      if (committed != -1) emitBit(committed);
-    }
-    queue1.freeBuffer();
-  }
-
-  drainBitBuffer();
-}
-
+uint32_t prevTime; 
+int prevBit;
+ 
 void loop() {
   // Audio processing — fast, no Serial
   if (queue1.available()) {
@@ -296,69 +154,44 @@ void loop() {
     for (int i = 0; i < 128; i++) {
       float x = block[i] / 32768.0f;
 
-    int softBit = -1;
+      int softBit = -1;
 
-    if (DEMOD_SELECT == DEMOD_GOERTZEL_IIR) {
-      // ── Per-sample IQ envelope (your guideline) ───────────────────────────
-      float em = markDet.process(x);
-      float es = spaceDet.process(x);
-      softBit = (em > es) ? 1 : 0;
-
-    } else {
-      // ── Sliding FFT (hop-based) ───────────────────────────────────────────
-      fftRingBuf[fftRingHead] = x;
-      fftRingHead = (fftRingHead + 1) % FFT_N;
-      fftHopCount++;
-      if (fftHopCount >= FFT_HOP) {
-        fftHopCount = 0;
-        softBit = fftDecide();
-      }
-      // softBit stays -1 for the other HOP-1 samples
-    }
+      if (DEMOD_SELECT == DEMOD_GOERTZEL_IIR) {
+        float em = markDet.process(x);
+        float es = spaceDet.process(x);
+        softBit = (em > es) ? 1 : 0;
+      } 
+      // else {
+      //   // ── Sliding FFT (hop-based) ───────────────────────────────────────────
+      //   fftRingBuf[fftRingHead] = x;
+      //   fftRingHead = (fftRingHead + 1) % FFT_N;
+      //   fftHopCount++;
+      //   if (fftHopCount >= FFT_HOP) {
+      //     fftHopCount = 0;
+      //     softBit = fftDecide();
+      //   }
+      //   // softBit stays -1 for the other HOP-1 samples
+      // }
 
       int committed = clockRecovery(softBit);
-      if (committed != -1) emitBit(committed);  // non-blocking
+      if (committed != -1) {
+          //emitBit(committed);
+          Serial.print(committed);
+          if (++bitCount % 100 == 0) Serial.println();
+
+          uint32_t printCycles = ARM_DWT_CYCCNT - prevTime;
+          // Print this separately so it doesn't recurse :)
+          if(committed == prevBit)
+            //Serial.printf(" %d bit, bit interval %lu cycles (%.2f us)\n", committed, 
+            //            printCycles, (float)printCycles / (F_CPU / 1000000.0f));
+            Serial.printf("x");
+
+          prevTime = ARM_DWT_CYCCNT;
+          prevBit = committed;
+      }
     }
     queue1.freeBuffer();
   }
-
-  // Serial printing — runs whenever CPU is idle between audio blocks
-  //drainBitBuffer();
 }
 
-
-void loop_buggy() {
-  if (!queue1.available()) return;
-
-  int16_t* block = queue1.readBuffer();
-
-  for (int i = 0; i < 128; i++) {
-    float x = block[i] / 32768.0f;
-
-    int softBit = -1;
-
-    if (DEMOD_SELECT == DEMOD_GOERTZEL_IIR) {
-      // ── Per-sample IQ envelope (your guideline) ───────────────────────────
-      float em = markDet.process(x);
-      float es = spaceDet.process(x);
-      softBit = (em > es) ? 1 : 0;
-
-    } else {
-      // ── Sliding FFT (hop-based) ───────────────────────────────────────────
-      fftRingBuf[fftRingHead] = x;
-      fftRingHead = (fftRingHead + 1) % FFT_N;
-      fftHopCount++;
-      if (fftHopCount >= FFT_HOP) {
-        fftHopCount = 0;
-        softBit = fftDecide();
-      }
-      // softBit stays -1 for the other HOP-1 samples
-    }
-  
-    // Clock advances every sample regardless
-    int committed = clockRecovery(softBit);
-    if (committed != -1) emitBit(committed);
-  }
-
-  queue1.freeBuffer();
-}
+ 

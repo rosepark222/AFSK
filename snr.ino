@@ -5,35 +5,6 @@
 // Noise floor printed on every measurement line
 // ============================================================
 
-/*
-
-========================================
- AFSK SNR Meter — 6000/8000 Hz Goertzel
- Teensy 4.1 + SPH0645LM4H I2S Mic
-========================================
-
-CALIBRATION: Keep channel SILENT for 2s...
-..........
-
-── Calibration Result ──────────────────
-   Noise floor power : 3.124000e-07
-   Noise floor        : -65.1 dB
-   Samples averaged   : 68
-────────────────────────────────────────
-
-NOW TRANSMIT: 01010101... at 10 baud
-  Mark  = 6000 Hz | Space = 8000 Hz
-  100ms per bit
-
-Tone    Mark Pwr    Space Pwr   SNR (dB)   Noise Floor       Bar (0–40dB)
-----------------------------------------------------------------------
-MARK    0.048821    0.000103    +48.3 dB   NF=3.124e-07      [=====================   ]
-SPACE   0.000091    0.041204    +47.1 dB   NF=3.124e-07      [====================    ]
-TRANS   0.021100    0.019800    +39.4 dB   NF=3.124e-07      [==================      ]
-MARK    0.048710    0.000098    +48.4 dB   NF=3.124e-07      [=====================   ]
-  
-*/
-
 #include <Audio.h>
 #include <Wire.h>
 
@@ -47,8 +18,12 @@ AudioConnection c2(i2s_in, 0, queue,     0);
 
 // ── Config ───────────────────────────────────────────────────
 static const float SAMPLE_RATE  = 44100.0f;
-static const float MARK_HZ      = 6000.0f;
-static const float SPACE_HZ     = 8000.0f;
+//static const float MARK_HZ      = 6000.0f;
+//static const float SPACE_HZ     = 8000.0f;
+
+static const float MARK_HZ      = 15000.0f;
+static const float SPACE_HZ     = 17000.0f;
+
 static const int   BLOCK_SIZE   = 128;
 static const int   CALIBRATE_MS = 2000;
 static const int   REPORT_MS    = 200;
@@ -193,25 +168,28 @@ void loop() {
     else if (spacePow > markPow  * 2.0f) label = "SPACE";
     else                                  label = "TRANS";   // transitioning
 
-    // Print measurement — noise floor on every line
-    Serial.printf("%-7s %-11.6f %-11.6f %+8.1f dB  %-16s  ",
-                  label,
-                  markPow,
-                  spacePow,
-                  snr,
-                  noiseFloorStr);     // <-- always visible
-    printBar(snr / 40.0f);            // full bar = 40 dB SNR
+    const char* quality;
+    if      (snr >= 25.0f) quality = "EXCELLENT";
+    else if (snr >= 20.0f) quality = "GOOD     ";
+    else if (snr >= 15.0f) quality = "FAIR     ";
+    else if (snr >= 10.0f) quality = "MARGINAL ";
+    else if (snr >=  6.0f) quality = "POOR     ";
+    else                   quality = "UNUSABLE ";
+
+    Serial.printf("%-7s %-11.6f %-11.6f %+8.1f dB  %-16s  %-10s ",
+                label, markPow, spacePow, snr, noiseFloorStr, quality);
+    printBar(snr / 40.0f);
     Serial.println();
 
-    // Warnings
-    if (markPow < 1e-9f && spacePow < 1e-9f && snr < -90.0f) {
-        Serial.println("  *** WARNING: No signal detected — "
-                       "check mic wiring or transmitter ***");
-    } else if (snr < 6.0f) {
-        Serial.println("  *** WARNING: SNR < 6 dB — "
-                       "decoding will be unreliable ***");
-    } else if (snr < 12.0f) {
-        Serial.println("  *** CAUTION: SNR < 12 dB — "
-                       "marginal decoding quality ***");
-    }
+    // // Warnings
+    // if (markPow < 1e-9f && spacePow < 1e-9f && snr < -90.0f) {
+    //     Serial.println("  *** WARNING: No signal detected — "
+    //                    "check mic wiring or transmitter ***");
+    // } else if (snr < 6.0f) {
+    //     Serial.println("  *** WARNING: SNR < 6 dB — "
+    //                    "decoding will be unreliable ***");
+    // } else if (snr < 12.0f) {
+    //     Serial.println("  *** CAUTION: SNR < 12 dB — "
+    //                    "marginal decoding quality ***");
+    // }
 }
