@@ -1,80 +1,93 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-# Sampling parameters
-fs = 1000            # samples/sec
-duration = 0.3       # seconds
+# ============================================================
+# Parameters
+# ============================================================
+fs = 441000            # try 1000 or 441000
+baud = 300
+SAMPLES_PER_BIT = int(fs / baud)
+duration = 0.06
+
 t = np.arange(0, duration, 1/fs)
 
-bit_ms = 10
-bit_samples = int(bit_ms * fs / 1000)
-
-# Original bit pattern: 101010...
+# ============================================================
+# TX bits (mid-bit transitions)
+# ============================================================
 bits = np.zeros_like(t)
 for i in range(len(t)):
-    bits[i] = 1 if ((i // bit_samples) % 2 == 0) else 0
+    bit_index = (i + SAMPLES_PER_BIT//2) // SAMPLES_PER_BIT
+    bits[i] = 1 if (bit_index % 2 == 0) else 0
 
-# MARK / SPACE presence
-mark_in = bits
+mark_in  = bits
 space_in = 1 - bits
 
-# Leaky integrator (LPF)
-alpha = 0.03
-mark_lpf = np.zeros_like(t)
+# ============================================================
+# LPF (CORRECTLY SCALED)
+# ============================================================
+LPF_FC = 200.0  # Hz
+alpha = 1.0 - np.exp(-2*np.pi*LPF_FC / fs)
+print("alpha", alpha)
+
+mark_lpf  = np.zeros_like(t)
 space_lpf = np.zeros_like(t)
 
 for i in range(1, len(t)):
-    mark_lpf[i]  = mark_lpf[i-1]  + alpha * (mark_in[i]  - mark_lpf[i-1])
-    space_lpf[i] = space_lpf[i-1] + alpha * (space_in[i] - space_lpf[i-1])
+    mark_lpf[i]  = mark_lpf[i-1]  + alpha*(mark_in[i]  - mark_lpf[i-1])
+    space_lpf[i] = space_lpf[i-1] + alpha*(space_in[i] - space_lpf[i-1])
 
-# Decision metric
 diff = mark_lpf - space_lpf
 
-# Sampling instants (mid‑bit)
-num_bits = int(duration * fs / bit_samples)
-sample_indices = [
-    i * bit_samples + bit_samples // 2
-    for i in range(num_bits)
-    if i * bit_samples + bit_samples // 2 < len(t)
-]
+# ============================================================
+# Clock recovery (fs-independent)
+# ============================================================
+EL_STEP = max(1, int(0.05 * SAMPLES_PER_BIT))  # 5% of bit
+#EL_STEP = 2
+print("Early Late STEP", EL_STEP)
 
-# Plot
-fig, ax1 = plt.subplots(figsize=(11,5))
+clockCounter = 500
+lastSoft = -1
+clock_phase = np.zeros_like(t)
+sample_points = []
 
-ax1.plot(t*1000, mark_lpf, label='MARK LPF', linewidth=2)
-ax1.plot(t*1000, space_lpf, label='SPACE LPF', linewidth=2)
-ax1.plot(t*1000, diff, label='MARK − SPACE (decision)', color='green', linewidth=2)
+for i in range(len(t)):
+    softBit = 1 if diff[i] > 0 else 0
 
-# Sample points
-ax1.scatter(
-    np.array(sample_indices)/fs*1000,
-    diff[sample_indices],
-    color='black',
-    zorder=5,
-    label='Sample points (mid‑bit)'
-)
+    if lastSoft != -1 and softBit != lastSoft:
+        mid = SAMPLES_PER_BIT // 2
+        if clockCounter < mid:
+            clockCounter += EL_STEP  # bit transition (edge) is early (left) -> clock is too slow ->  speed up the clock
+        else:
+            clockCounter -= EL_STEP  # bit transition (edge) is late (right) -> clock is too fast ->  slow down the clock
 
-ax1.axhline(0, color='gray', linestyle='--')
-ax1.set_xlabel('Time (ms)')
-ax1.set_ylabel('Envelope / Difference')
-ax1.grid(True)
+    lastSoft = softBit
 
-# Original bits overlay
-ax2 = ax1.twinx()
-ax2.step(
-    t*1000, bits,
-    where='post',
-    linestyle='--',
-    color='black',
-    label='Original bits (101010)'
-)
-ax2.set_ylabel('Bit value')
-ax2.set_ylim(-0.2, 1.2)
+    clockCounter += 1
+    if clockCounter >= SAMPLES_PER_BIT:
+        clockCounter = 0
+        sample_points.append(i)
 
-# Legend
-lines1, labels1 = ax1.get_legend_handles_labels()
-lines2, labels2 = ax2.get_legend_handles_labels()
-ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+    clock_phase[i] = clockCounter / SAMPLES_PER_BIT
 
-plt.title('FSK Detection: MARK/SPACE LPFs, Difference, and Sampling')
+# ============================================================
+# Single plot
+# ============================================================
+plt.figure(figsize=(11,4))
+
+plt.step(t*1000, mark_in*0.6, where='post', linestyle=':', label='mark_in')
+plt.step(t*1000, space_in*0.6, where='post', linestyle=':', label='space_in')
+
+plt.plot(t*1000, mark_lpf, label='MARK LPF', color='blue')
+plt.plot(t*1000, space_lpf, label='SPACE LPF', color='red')
+plt.plot(t*1000, diff, label='MARK - SPACE', color='green')
+plt.plot(t*1000, clock_phase*0.5, label='clockCounter', color='purple')
+
+plt.scatter(np.array(sample_points)/fs*1000,
+            diff[sample_points], color='black')
+
+plt.axhline(0, color='gray', linestyle='--')
+plt.legend()
+plt.grid(True)
+plt.title(f'Robust FSK RX (fs = {fs} Hz)')
+plt.xlabel('Time (ms)')
 plt.show()
