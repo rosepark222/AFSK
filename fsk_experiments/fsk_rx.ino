@@ -99,9 +99,9 @@ int clockRecovery(int softBit) {
   if (softBit != -1 && lastSoft != -1 && softBit != lastSoft) {
     int mid = SAMPLES_PER_BIT / 2;
     if (clockCounter < mid)
-      clockCounter += 2;   // we're early → slow down slightly
+      clockCounter += 2;   // bit transition (edge) is early (left) -> clock is too slow ->  speed up the clock
     else
-      clockCounter -= 2;   // we're late  → speed up slightly
+      clockCounter -= 2;   // bit transition (edge) is late (right) -> clock is too fast ->  slow down the clock
     lastSoft = softBit;
   }
   if (softBit != -1) lastSoft = softBit;
