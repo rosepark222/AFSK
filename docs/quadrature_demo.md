@@ -34,15 +34,17 @@ To recover the original data at the receiver, we split the incoming signal into 
 Multiply the received signal by $\cos(\omega_c t)$:
 $$I_{raw} = [I \cos(\omega_c t) - Q \sin(\omega_c t)] \cdot \cos(\omega_c t)$$
 $$I_{raw} = I \cos^2(\omega_c t) - Q \sin(\omega_c t)\cos(\omega_c t)$$
-Using identities $$\cos^2\theta = \frac{1+\cos(2\theta)}{2}$$ and $$\sin\theta\cos\theta = \frac{\sin(2\theta)}{2}$$:
-$$I_{raw} = \underbrace{\frac{I}{2}}_{\text{Baseband (DC)}} + \underbrace{\frac{I}{2}\cos(2\omega_c t) - \frac{Q}{2}\sin(2\omega_c t)}_{\text{High Frequency Junk}}$$
+Using identities $$\cos^2\theta = \frac{1+\cos(2\theta)}{2}$$ and $$\sin\theta\cos\theta = \frac{\sin(2\theta)}{2}$$:  
+$$I_{raw} =  \frac{I}{2}  +  \frac{I}{2}\cos(2\omega_c t) - \frac{Q}{2}\sin(2\omega_c t)$$
+
 ## The Quadrature Path ($Q$)
 Multiply the received signal by $-\sin(\omega_c t)$:
 $$Q_{raw} = [I \cos(\omega_c t) - Q \sin(\omega_c t)] \cdot (-\sin(\omega_c t))$$
-$$Q_{raw} = \underbrace{\frac{Q}{2}}_{\text{Baseband (DC)}} + \underbrace{\text{High Frequency Junk (at } 2\omega_c \text{)}}_{\dots}$$
+$$Q_{raw} =  \frac{Q}{2}  +  \text{High Frequency Junk (at } 2\omega_c \text{)} $$
 ------------------------------
 ## 4. The Role of the Low Pass Filter (LPF)
 In the physical world (using real numbers), multiplication always creates a "sum" frequency ($2\omega_c$). We must apply an LPF to isolate the baseband data:
+
 $$I_{final} = \text{LPF}\{I_{raw}\} = \frac{I}{2}$$
 $$Q_{final} = \text{LPF}\{Q_{raw}\} = \frac{Q}{2}$$
 ------------------------------
