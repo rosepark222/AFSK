@@ -31,6 +31,11 @@ To send a complex signal through a single physical channel (like a speaker), we 
 ------------------------------
 ## 3. Why mix up and down?
 
+<img width="800" height="547" alt="image" src="https://github.com/user-attachments/assets/8ecfead5-9fab-40ce-bde5-6672881f7d8a" />
+
+https://circuitcellar.com/cc-blog/fundamentals-of-iq-signals/
+
+
 Mixing Up (Up-conversion): You take your low-frequency information (the baseband signal) and multiply it by a high-frequency carrier, $\cos(\omega t)$, to shift it into the radio or audio frequency range for transmission.  
 
 Mixing Down (Down-conversion): You take that high-frequency received signal and multiply it by a local oscillator at the same frequency. This shifts the information back down to 0 Hz (baseband) so you can process it.  
@@ -51,6 +56,9 @@ Our ears (and our computers) can’t "hear" at 100 million cycles per second—t
 Summary  
 Mix Up: To make the signal "fit" onto small antennas and to avoid everyone talking over each other.  
 Mix Down: To turn that high-speed "transport" wave back into something our speakers and ears can actually use.  
+
+
+
 
 ------------------------------
 ## 4. Quadrature Demodulation (Receiver)
@@ -75,13 +83,13 @@ Multiply the received signal by $-\sin(\omega_c t)$:
 $$Q_{raw} = [I \cos(\omega_c t) - Q \sin(\omega_c t)] \cdot (-\sin(\omega_c t))$$
 $$Q_{raw} =  \frac{Q}{2}  +  \text{High Frequency Junk (at } 2\omega_c \text{)} $$
 ------------------------------
-## 4. The Role of the Low Pass Filter (LPF)
+## 5. The Role of the Low Pass Filter (LPF)
 In the physical world (using real numbers), multiplication always creates a "sum" frequency ($2\omega_c$). We must apply an LPF to isolate the baseband data:
 
 $$I_{final} = \text{LPF}\{I_{raw}\} = \frac{I}{2}$$
 $$Q_{final} = \text{LPF}\{Q_{raw}\} = \frac{Q}{2}$$
 ------------------------------
-## 5. Non-Coherent Detection (Energy)
+## 6. Non-Coherent Detection (Energy)
 In a non-coherent receiver, the absolute phase $\phi$ is unknown or shifting. To detect the signal regardless of the phase, we calculate the Magnitude or Energy:
 Recovered Amplitude:
 $$A \propto \sqrt{I_{final}^2 + Q_{final}^2}$$
@@ -93,7 +101,7 @@ remember that
 * $Q = A \sin(\phi)$ (Quadrature component)  
 and because $\cos^2\phi + \sin^2\phi = 1$, this calculation removes the phase dependency, allowing you to "see" the signal even if the phase is spinning.
 ------------------------------
-## 6. How is it related to FSK?
+## 7. How is it related to FSK?
 The tramitter sends two signals depending on the data  
 for bit=1 (mark)
 $$x_{mark}(t)= A\cos(2\pi f_{1} t   + \phi_{1}) $$
@@ -118,4 +126,16 @@ Remember, each bit lasts for its duration (e.g., 10ms for 100 baud, 1ms for 1000
 Thus it is important to know when each bit starts and ends, because receiver does not want to make bit decision at the bit transition. It is best to make a decision at the center of bit duration.  
 
 For this, we need to learn about clock recovery method [clock_recovery](clock_recovery.md)
+
+
+
+## References:
+
+$$\cos(\alpha + \beta) = \cos\alpha \cos\beta - \sin\alpha \sin\beta$$      
+useful to express signal with arbitrary phase to I and Q components   
+
+$$\cos\alpha \cos\beta = \frac{1}{2}[\cos(\alpha + \beta) + \cos(\alpha - \beta)]$$    
+useful for modulation/demodulation   
+
+
 
