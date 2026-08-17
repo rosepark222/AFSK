@@ -9,15 +9,25 @@ This is how we often visualize a wave:
 $$x(t)= A\cos(\omega_c t + \phi)$$
 
 ## Cartesian Coordinates (I & Q Components)
-Using the trigonometric identity $$\cos(\alpha + \beta) = \cos\alpha \cos\beta - \sin\alpha \sin\beta$$  
-, we can rewrite the signal as:
-$$x(t) = A \cos(\phi) \cos(\omega_c t) - A \sin(\phi) \sin(\omega_c t)$$
-or
-$$x(t) = I \cos(\omega_c t) - Q \sin(\omega_c t)$$
-Where:
+Using the trigonometric identity  
 
-* $I = A \cos(\phi)$ (In-phase component)
-* $Q = A \sin(\phi)$ (Quadrature component)
+$$\cos(\alpha + \beta) = \cos\alpha \cos\beta - \sin\alpha \sin\beta$$  
+
+, we can rewrite the signal as:  
+
+$$x(t) = A \cos(\phi) \cos(\omega_c t) - A \sin(\phi) \sin(\omega_c t)$$
+
+or
+
+$$x(t) = I \cos(\omega_c t) - Q \sin(\omega_c t)$$  
+
+Where In-phase and quadrature components are  
+
+$$I = A \cos(\phi)$$   
+
+$$Q = A \sin(\phi)$$
+
+  
 
 ------------------------------
 ## 2. Quadrature Modulation (Transmitter)
@@ -68,48 +78,75 @@ To recover the original data at the receiver, we split the incoming signal into 
 
 ## The In-phase Path ($I$)
 Multiply the received signal by $\cos(\omega_c t)$:
+
 $$I_{raw} = x_{RX}(t) \cdot \cos(\omega_c t)$$
+
 $$I_{raw} = [I \cos(\omega_c t) - Q \sin(\omega_c t)] \cdot \cos(\omega_c t)$$
+
 $$I_{raw} = I \cos^2(\omega_c t) - Q \sin(\omega_c t)\cos(\omega_c t)$$
+
 Using identities  
-$$\cos^2\theta = \frac{1+\cos(2\theta)}{2}$$ and $$\sin\theta\cos\theta = \frac{\sin(2\theta)}{2}$$
+
+$$\cos\theta \cos\theta = \frac{1}{2} [ 1 + \cos(2\theta) ]$$ and $$\sin\theta\cos\theta = \frac{\sin(2\theta)}{2}$$
+
 then  
-$$I_{raw} =  \frac{I}{2}  +  \frac{I}{2}\cos(2\omega_c t) - \frac{Q}{2}\sin(2\omega_c t)$$
+
+$$I_{raw} =  \frac{I}{2}  +  \frac{I}{2}\cos(2\omega_c t) - \frac{Q}{2}\sin(2\omega_c t)$$  
+
 which is  
-$$I_{raw} =  \frac{I}{2}  +  \text{High Frequency Junk (at } 2\omega_c \text{)} $$
+
+$$I_{raw} =  \frac{I}{2}  +  \text{High Frequency Junk (at } 2\omega_c \text{)} $$  
+
 
 ## The Quadrature Path ($Q$)
-Multiply the received signal by $-\sin(\omega_c t)$:
-$$Q_{raw} = [I \cos(\omega_c t) - Q \sin(\omega_c t)] \cdot (-\sin(\omega_c t))$$
-$$Q_{raw} =  \frac{Q}{2}  +  \text{High Frequency Junk (at } 2\omega_c \text{)} $$
+Multiply the received signal by $-\sin(\omega_c t)$:  
+
+$$Q_{raw} = [I \cos(\omega_c t) - Q \sin(\omega_c t)] \cdot (-\sin(\omega_c t))$$  
+
+$$Q_{raw} =  \frac{Q}{2}  +  \text{High Frequency Junk (at } 2\omega_c \text{)} $$  
+
 ------------------------------
 ## 5. The Role of the Low Pass Filter (LPF)
 In the physical world (using real numbers), multiplication always creates a "sum" frequency ($2\omega_c$). We must apply an LPF to isolate the baseband data:
 
-$$I_{final} = \text{LPF}\{I_{raw}\} = \frac{I}{2}$$
-$$Q_{final} = \text{LPF}\{Q_{raw}\} = \frac{Q}{2}$$
+$$I_{final} = \text{LPF}\{I_{raw}\} = \frac{I}{2}$$  
+
+$$Q_{final} = \text{LPF}\{Q_{raw}\} = \frac{Q}{2}$$  
+
 ------------------------------
 ## 6. Non-Coherent Detection (Energy)
 In a non-coherent receiver, the absolute phase $\phi$ is unknown or shifting. To detect the signal regardless of the phase, we calculate the Magnitude or Energy:
-Recovered Amplitude:
-$$A \propto \sqrt{I_{final}^2 + Q_{final}^2}$$
-Signal Energy:
-$$E \propto I_{final}^2 + Q_{final}^2$$
+Recovered Amplitude:  
+
+$$A \propto \sqrt{I_{final}^2 + Q_{final}^2}$$  
+
+Signal Energy:  
+
+$$E \propto [I_{final}^2 + Q_{final}^2]$$  
+
 
 remember that 
 * $I = A \cos(\phi)$ (In-phase component)  
 * $Q = A \sin(\phi)$ (Quadrature component)  
-and because $\cos^2\phi + \sin^2\phi = 1$, this calculation removes the phase dependency, allowing you to "see" the signal even if the phase is spinning.
+and because $\cos^2\phi + \sin^2\phi = 1$, this calculation removes the phase dependency, allowing you to "see" the signal even if the phase is unknown.
 ------------------------------
 ## 7. How is it related to FSK?
 The tramitter sends two signals depending on the data  
-for bit=1 (mark)
-$$x_{mark}(t)= A\cos(2\pi f_{1} t   + \phi_{1}) $$
-for bit=0 (space)
-$$x_{space}(t)= A\cos(2\pi f_{0} t   + \phi_{0}) $$
+for bit=1 (mark)  
+
+$$x_{mark}(t)= A\cos(2\pi f_{1} t   + \phi_{1}) $$  
+
+for bit=0 (space)  
+
+$$x_{space}(t)= A\cos(2\pi f_{0} t   + \phi_{0}) $$  
 
 
-With a 100 baud rate, the duration of each bit is 10 ms. Therefore, transmitting the data "101" corresponds to sending $x_{mark}(t)$, $x_{space}(t)$, and $x_{mark}(t)$ sequentially, with each signal lasting 10 ms and no time gap between them.
+
+With a 100 baud rate, the duration of each bit is 10 ms. Therefore, transmitting the data "101" corresponds to sending  
+
+$$x_{mark}(t), x_{space}(t), x_{mark}(t)$$   
+
+sequentially, with each signal lasting 10 ms and no time gap between them.
 
 At a given time, the received signal is either $x_{mark}(t)$ or $x_{space}(t)$, not both. However, we do not know which one is transmitted, we check both and decide which bit was transmitted.  
 
