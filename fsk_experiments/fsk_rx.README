@@ -75,3 +75,49 @@ What I would do next if I were iterating
 - Add the persistence + confidence change above and test with recorded audio to tune TRANS_PERSIST and MIN_CONFIDENCE.
 - If performance still poor under channel impairments, implement a Gardner TED (several short, well-known implementations exist) for robust symbol timing recovery and remove the ad-hoc ±2 adjustments.
 
+
+Q: Do you expect this persistence+confidence update would improve clock recovery significantly? Under what conditions — e.g., would it hurt at high-speed FSK?
+
+A: Short answer: Yes — persistence+confidence usually helps noticeably for moderate baud rates and moderate noise, but it can hurt at very high baud rates (few samples/bit) because it delays or filters true transitions. The effectiveness depends on SAMPLES_PER_BIT and channel SNR.
+
+Why it helps
+- It prevents single-sample noise blips from being treated as symbol edges, so the clockRecovery loop isn’t nudged by transient errors. That reduces timing jitter, lowers false resync events, and typically reduces BER in noisy channels.
+- Confidence (energy difference) blocks small, ambiguous flips where em and es are nearly equal, so weak/noisy samples don’t count as transitions.
+
+Tradeoffs / when it can hurt
+- Latency: requiring N consecutive samples adds ~N-sample delay before a new soft decision is considered. That slows clock adjustments and symbol-edge detection.
+- Missed true edges: if N is too large relative to SAMPLES_PER_BIT, short symbols or fast transitions can be missed or cause phase offsets.
+- At very high baud (very few samples per bit) there simply aren’t enough samples to require persistence — it will reduce agility and can degrade performance.
+
+Concrete guidance (use your repo constants)
+- Compute SAMPLES_PER_BIT = SAMPLE_RATE / BAUD_RATE. With your defaults (SAMPLE_RATE = 44100, BAUD_RATE = 100) SAMPLES_PER_BIT ≈ 441 — persistence=3 is tiny and safe.
+- Rule-of-thumb for TRANS_PERSIST:
+  - SAMPLES_PER_BIT >= 100: TRANS_PERSIST = 3–6
+  - 20 <= SAMPLES_PER_BIT < 100: TRANS_PERSIST = 2–3
+  - 8 <= SAMPLES_PER_BIT < 20: TRANS_PERSIST = 1–2
+  - SAMPLES_PER_BIT < 8: avoid persistence (use 1 / no debounce) — prefer a timing-PLL instead
+  (Reason: TRANS_PERSIST should be small compared to the bit interval so you don’t lose timing resolution.)
+- Confidence threshold: use a normalized metric rather than raw energy. For example
+  d = (em - es) / (em + es + 1e-6)
+  then require d > THRESH (and maybe d < -THRESH for the other polarity). Start with THRESH ≈ 0.08–0.15 and tune from there. Raw abs(em - es) works but is amplitude-dependent.
+- Combine techniques: use small persistence + normalized confidence + hysteresis (different thresholds for rising/falling) for best robustness.
+
+When to move beyond debounce+confidence
+- If BAUD_RATE is high (so SAMPLES_PER_BIT ≲ 10) or channel noise/fading is severe, implement a proper timing-error detector + PLL (e.g., Gardner or Mueller & Muller). Those use interpolated samples and a loop filter to estimate continuous timing error and are much more robust than sample-count debounce.
+- If amplitude varies a lot, use an adaptive confidence threshold (e.g., running estimate of signal energy / noise floor).
+
+How much improvement to expect
+- In moderate SNR (occasional single-sample blips), you’ll often see a large reduction in spurious clock nudges and a measurable BER drop.
+- In severe noise where many consecutive samples are wrong, persistence won’t help — that’s when a TED/PLL or stronger front-end filtering is necessary.
+- For your current 100 baud example (441 samples/bit), persistence=3 + normalized threshold should be almost always beneficial with near-zero downside.
+
+Suggested testing
+- Synthetic tests: inject single-sample blips (randomly flip 1 sample) and measure false-edge rate with/without persistence.
+- AWGN sweep: test BER and false-edge rate vs SNR and tune TRANS_PERSIST and THRESH.
+- Real recordings: measure preamble acquisition time and overall sync reliability.
+
+If you want, I can:
+- Patch fsk_experiments/fsk_rx.ino to add persistence+normalized confidence with adaptive defaults and commit it, or
+- Sketch a Gardner TED implementation tuned to your SAMPLE_RATE/BAUD_RATE.
+
+Which would you like me to do next?
