@@ -63,20 +63,33 @@ How to explain this to anyone (including a high‑schooler)
 | Gray horizontal line (zero) | decision threshold |
 
 <img width="1143" height="882" alt="image" src="https://github.com/user-attachments/assets/13fa9053-ca50-453e-80b4-2afeb347f795" />
-purple triangle is clockCount ranged from 0 to 441 (sample per bit). The goal of this clock is to align its mid point to the bit transition, so that the wrap point is when to sample the bit.
+purple triangle is clockCount ranged from 0 to 441 (sample per bit) assuming 100 baud (10ms per bit).  
 
+The goal of clock recovery is to align its mid point (220 ish) to the bit transition, so that the wrap point (441->0) is timing to determine the bit.
 
-The figure shows phase jumping forward in early stage of clock recovery. Why jumping forward?   
-1, clock phase < mid point. In PLL textbook, this means the bit edge is "early" relative to the clock)  
-2, clock is too slow, causing sample point late (see that black dots are pushed toward the end of the bit duration)  
-3, clock phase should jump forward to pull the sampling point to the left  
-4, in the below example, 20 to 30 jump pulls the sampling point to the left by 10 samples  
-  $0, 1, 2, ... 20, 30, 31, ... 441 → wrap → sample$    
+For 44.1Khz sampling rate, 10ms bit duration produces 441 sample. The quadrature demodulation makes decision per sample called softBit.
+
+softBit makes a transition from 0 to 1 or 1 to 0 at the bit boundary --  this is somewhat naive approach.  
+
+and this bit boundary is where the mid point of clockCount (220) should be, so that clockCount wrap (441) is where the hard decision for the bit is made. 
+
+If the bit boundary is not clockCount=220, clockCount should be adjusted.
+
+In the above figure, clockCount advances 5 times. because  
+1, clockCount < 220. In PLL textbook, this means the bit edge is "early" relative to the clock)  
+2, sampling point (clockCount=441) is too late  
+3, clockCount should move forward (added some value) to pull the sampling point to the left  
+ 
 
 ---
 
 <img width="1148" height="889" alt="image" src="https://github.com/user-attachments/assets/c2dcce9e-76c7-48df-be05-d1fadfc2cdab" />
-When the bit edge is recovered, we can see clock is pulled toward left in one bit and toward right for the next bit, etc.
+
+
+The above figure shows When the bit boundary is where clockCount = 220 (clock is recovered).  
+Here, clockCount is pushed and pulled and keeps the wrap point to the center of the bit. 
+
+
 
 ---
 
