@@ -1,0 +1,77 @@
+Q: The clockRecovery assumes the bit transition is determined by softBit != lastSoft. What happens if the softBit is flipped by error and the detected bit transition is not a true bit transition?
+
+A: Short answer: if a softBit flip is caused by noise (not a real symbol edge), the clockRecovery will treat it like a real transition and nudge the internal clock. Repeated false edges cause timing jitter, wrong clock phase, and can eventually make the sampler commit the wrong bit (bit slips) or lose sync entirely.
+
+Why this happens (details)
+- The code treats any change softBit != lastSoft as an edge and immediately adjusts clockCounter by ±2 samples. That single-sample edge detector has no protection against short noise blips.
+- A brief noisy flip will be interpreted as an "early" or "late" transition and the algorithm will speed up/slow down the clock incorrectly.
+- If noise produces many such spurious flips, the clock will oscillate and the committed bits will be wrong (false commits, bit timing drift, or repeated resync attempts).
+
+Practical mitigations (ordered by complexity / effectiveness)
+1. Debounce / require persistence
+   - Only accept a transition if the new soft decision persists for N consecutive samples (or a majority in a sliding window). This is the simplest and often effective for short blips.
+
+2. Require confidence (use soft metric)
+   - Use the magnitude difference (e.g., abs(em - es)) and ignore flips unless the energy difference exceeds a threshold. That prevents small noisy changes from counting.
+   - Combine confidence + persistence for best results.
+
+3. Hysteresis on decision threshold
+   - Add upper/lower thresholds so you need a stronger change to flip from 0→1 than 1→0.
+
+4. Use a proper timing PLL / TED (recommended for robust demod)
+   - Use Gardner or Mueller and Muller timing-error detectors which compute a continuous timing error from sample waveform and drive a loop filter. These handle noise much better than ad-hoc early/late gates.
+
+5. Use matched filtering / stronger prefiltering
+   - Improve SNR before making per-sample soft decisions (longer LPF, matched filters, preamble correlation).
+
+Concrete, minimal code fixes you can try now
+- Example A: persistence + confidence (simple, safe). Insert this around where you produce softBit (only for GOERTZEL path shown):
+
+```c++
+// add near top-level globals:
+const int TRANS_PERSIST = 3;           // require N samples of same soft decision
+const float MIN_CONFIDENCE = 0.02f;   // tune: require energy difference > threshold
+static int pendingSoft = -1;
+static int pendingCount = 0;
+
+...
+// inside the loop, after em/es computed:
+float em = markDet.process(x);
+float es = spaceDet.process(x);
+int rawSoft = (em > es) ? 1 : 0;
+float conf = fabsf(em - es); // or (em - es) / (em + es + 1e-6f) for normalized
+
+// thresholding
+if (conf < MIN_CONFIDENCE) {
+  rawSoft = -1; // undecided because confidence too low
+}
+
+// persistence / debounce
+if (rawSoft == -1) {
+  pendingSoft = -1;
+  pendingCount = 0;
+} else {
+  if (rawSoft == pendingSoft) {
+    pendingCount++;
+  } else {
+    pendingSoft = rawSoft;
+    pendingCount = 1;
+  }
+}
+
+// only treat as a soft decision when persisted enough
+int decidedSoft = (pendingCount >= TRANS_PERSIST) ? pendingSoft : -1;
+
+int committed = clockRecovery(decidedSoft);
+```
+
+- Example B: simpler majority filter over last K samples (no persistent counter overflow issues)
+  - Keep a small circular buffer of the last K soft samples, compute majority, and use that as soft decision.
+
+When to use a PLL / Gardner TED
+- If baud is high or channel/noise is serious, replace this early/late tweak with a proper fractional timing loop (Gardner or Mueller & Muller). Those produce a signed error signal proportional to timing offset and a loop filter that integrates it; they won’t react strongly to single-sample noise spikes.
+
+What I would do next if I were iterating
+- Add the persistence + confidence change above and test with recorded audio to tune TRANS_PERSIST and MIN_CONFIDENCE.
+- If performance still poor under channel impairments, implement a Gardner TED (several short, well-known implementations exist) for robust symbol timing recovery and remove the ad-hoc ±2 adjustments.
+
