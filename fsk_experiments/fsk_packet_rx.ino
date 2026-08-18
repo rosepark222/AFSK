@@ -1,12 +1,12 @@
 #include <Audio.h>
 #include <arm_math.h>
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────[...]
 // FSK Packet RX
 // Frame format:
 //   [4-byte preamble][1-byte start sync][1-byte size][payload][2-byte CRC][1-byte end sync]
 // RX continuously demodulates and performs clock recovery.
-// ─────────────────────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────[...]
 
 enum DemodMethod { DEMOD_GOERTZEL_IIR, DEMOD_FFT_SLIDING };
 const DemodMethod DEMOD_SELECT = DEMOD_GOERTZEL_IIR;
@@ -33,6 +33,14 @@ static const uint8_t START_SYNC    = 0x7E;
 static const uint8_t END_SYNC      = 0x7F;
 static const uint8_t PREAMBLE_LEN  = 4;
 static const uint8_t MAX_PAYLOAD   = 254;
+
+// ─── DEBUG COUNTERS ───────────────────────────────────────────────────────
+uint32_t debugBitCount = 0;
+uint32_t debugByteCount = 0;
+uint32_t debugBlockCount = 0;
+uint32_t lastDebugPrintMs = 0;
+float debugAvgMark = 0;
+float debugAvgSpace = 0;
 
 // ─── I/Q tone detector ───────────────────────────────────────────────────────
 struct IQDetector {
@@ -67,7 +75,7 @@ struct IQDetector {
 
 IQDetector markDet, spaceDet;
 
-// ─── Clock recovery ──────────────────────────────────────────────────────────
+// ─── Clock recovery ────────────────────────────────────────────────────────[...]
 const int SAMPLES_PER_BIT = (int)(SAMPLE_RATE / BAUD_RATE);
 int clockCounter = 0;
 int lastSoft = -1;
@@ -95,7 +103,7 @@ int clockRecovery(int softBit) {
   return committed;
 }
 
-// ─── CRC ─────────────────────────────────────────────────────────────────────
+// ─── CRC ─────────────────────────────────────────────────────────────[...]
 uint16_t crc16_ccitt_false_update(uint16_t crc, uint8_t data) {
   crc ^= ((uint16_t)data) << 8;
   for (uint8_t b = 0; b < 8; b++) {
@@ -153,6 +161,16 @@ enum RxState {
   RX_READ_END_SYNC
 };
 
+const char* stateNames[] = {
+  "PREAMBLE",
+  "SYNC",
+  "SIZE",
+  "PAYLOAD",
+  "CRC_HI",
+  "CRC_LO",
+  "END_SYNC"
+};
+
 RxState rxState = RX_SEARCH_PREAMBLE;
 uint8_t preambleMatch = 0;
 uint8_t sizeByte = 0;
@@ -162,7 +180,7 @@ uint16_t rxCrc = 0;
 uint8_t rxCrcHi = 0;
 uint32_t frameStartMs = 0;
 
-static const uint32_t FRAME_TIMEOUT_MS = 500;
+static const uint32_t FRAME_TIMEOUT_MS = 2000;  // Increased from 500ms
 
 void resetFrameParser() {
   rxState = RX_SEARCH_PREAMBLE;
@@ -173,11 +191,13 @@ void resetFrameParser() {
   rxCrcHi = 0;
   assembler.reset();
   frameStartMs = millis();
+  Serial.printf("[RESET] State -> %s, frameStartMs=%lu\n", stateNames[rxState], frameStartMs);
 }
 
 void rejectFrame(const char* reason) {
-  Serial.print("FRAME_REJECT: ");
-  Serial.println(reason);
+  uint32_t elapsed = millis() - frameStartMs;
+  Serial.printf("FRAME_REJECT: %s (State: %s, elapsed: %lu ms, bytes: %lu)\n", 
+    reason, stateNames[rxState], elapsed, debugByteCount);
   resetFrameParser();
 }
 
@@ -214,14 +234,24 @@ void processByte(uint8_t b) {
     return;
   }
 
+  debugByteCount++;
+  
+  // Debug: Print every byte received
+  Serial.printf("[BYTE %lu] 0x%02X (%3d) | State: %s", debugByteCount, b, b, stateNames[rxState]);
+
   switch (rxState) {
     case RX_SEARCH_PREAMBLE:
       if (b == PREAMBLE_BYTE) {
         preambleMatch++;
+        Serial.printf(" | Preamble match %d/%d", preambleMatch, PREAMBLE_LEN);
         if (preambleMatch >= PREAMBLE_LEN) {
           rxState = RX_SEARCH_SYNC;
+          Serial.printf(" -> Moving to SYNC");
         }
       } else {
+        if (preambleMatch > 0) {
+          Serial.printf(" | Preamble reset (was %d)", preambleMatch);
+        }
         preambleMatch = 0;
       }
       break;
@@ -229,54 +259,67 @@ void processByte(uint8_t b) {
     case RX_SEARCH_SYNC:
       if (b == START_SYNC) {
         rxState = RX_READ_SIZE;
+        Serial.printf(" | START_SYNC found -> SIZE");
       } else if (b != PREAMBLE_BYTE) {
         preambleMatch = 0;
         rxState = RX_SEARCH_PREAMBLE;
+        Serial.printf(" | Not sync, back to PREAMBLE");
       }
       break;
 
     case RX_READ_SIZE:
       sizeByte = b;
       if (sizeByte > MAX_PAYLOAD) {
+        Serial.printf(" | BAD_SIZE");
         rejectFrame("BAD_SIZE");
         return;
       }
       payloadIndex = 0;
       if (sizeByte == 0) {
         rxState = RX_READ_CRC_HI;
+        Serial.printf(" | Size=0 -> CRC_HI");
       } else {
         rxState = RX_READ_PAYLOAD;
+        Serial.printf(" | Size=%d -> PAYLOAD", sizeByte);
       }
       break;
 
     case RX_READ_PAYLOAD:
       payload[payloadIndex++] = b;
+      Serial.printf(" | Payload[%d]", payloadIndex - 1);
       if (payloadIndex >= sizeByte) {
         rxState = RX_READ_CRC_HI;
+        Serial.printf(" -> CRC_HI");
       }
       break;
 
     case RX_READ_CRC_HI:
       rxCrcHi = b;
       rxState = RX_READ_CRC_LO;
+      Serial.printf(" | CRC_HI=0x%02X -> CRC_LO", rxCrcHi);
       break;
 
     case RX_READ_CRC_LO:
       rxCrc = ((uint16_t)rxCrcHi << 8) | b;
       rxState = RX_READ_END_SYNC;
+      Serial.printf(" | CRC_LO, full CRC=0x%04X -> END_SYNC", rxCrc);
       break;
 
     case RX_READ_END_SYNC:
       if (b == END_SYNC) {
+        Serial.printf(" | END_SYNC found -> ACCEPT");
         acceptFrame();
       } else {
+        Serial.printf(" | Expected END_SYNC 0x%02X, got 0x%02X", END_SYNC, b);
         rejectFrame("MISSING_END_SYNC");
       }
       break;
   }
+  
+  Serial.println();
 }
 
-// ─── Setup/Loop ──────────────────────────────────────────────────────────────
+// ─── Setup/Loop ─────────────────────────────────────────────────────────[...]
 void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 3000) {}
@@ -289,12 +332,19 @@ void setup() {
 
   resetFrameParser();
 
-  Serial.println("FSK Packet RX ready");
+  Serial.println("\n=== FSK Packet RX ready ===");
+  Serial.printf("FREQ_MARK=%d Hz, FREQ_SPACE=%d Hz\n", (int)FREQ_MARK, (int)FREQ_SPACE);
+  Serial.printf("BAUD_RATE=%d, SAMPLE_RATE=%d\n", BAUD_RATE, (int)SAMPLE_RATE);
+  Serial.printf("SAMPLES_PER_BIT=%d\n", SAMPLES_PER_BIT);
+  Serial.printf("FRAME_TIMEOUT_MS=%d\n", FRAME_TIMEOUT_MS);
+  Serial.println("=== Waiting for frames... ===\n");
 }
 
 void loop() {
   if (queue1.available()) {
+    debugBlockCount++;
     int16_t* block = queue1.readBuffer();
+    float totalMark = 0, totalSpace = 0;
 
     for (int i = 0; i < 128; i++) {
       float x = block[i] / 32768.0f;
@@ -303,11 +353,14 @@ void loop() {
       if (DEMOD_SELECT == DEMOD_GOERTZEL_IIR) {
         float em = markDet.process(x);
         float es = spaceDet.process(x);
+        totalMark += em;
+        totalSpace += es;
         softBit = (em > es) ? 1 : 0;
       }
 
       int committed = clockRecovery(softBit);
       if (committed != -1) {
+        debugBitCount++;
         uint8_t byteVal;
         if (assembler.pushBit(committed, byteVal)) {
           processByte(byteVal);
@@ -315,6 +368,17 @@ void loop() {
       }
     }
 
+    debugAvgMark = totalMark / 128.0f;
+    debugAvgSpace = totalSpace / 128.0f;
+
     queue1.freeBuffer();
+
+    // Print stats every 2 seconds
+    uint32_t now = millis();
+    if (now - lastDebugPrintMs >= 2000) {
+      lastDebugPrintMs = now;
+      Serial.printf("\n[STATS] Blocks: %lu | Bits: %lu | Bytes: %lu | AvgMark: %.3f | AvgSpace: %.3f | State: %s\n\n",
+        debugBlockCount, debugBitCount, debugByteCount, debugAvgMark, debugAvgSpace, stateNames[rxState]);
+    }
   }
 }
