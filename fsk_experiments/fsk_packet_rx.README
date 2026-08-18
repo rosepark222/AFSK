@@ -1,0 +1,6 @@
+
+FD 55 55 55 55 F8 is current decoding but it should be 
+FF 55 55 55 55 7E where 7E is the start sync
+
+The receiver fasly assumes byte boundaries -- it should not determine the byte boundaries until it sees the start sync
+
