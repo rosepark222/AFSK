@@ -12,8 +12,12 @@ enum DemodMethod { DEMOD_GOERTZEL_IIR, DEMOD_FFT_SLIDING };
 const DemodMethod DEMOD_SELECT = DEMOD_GOERTZEL_IIR;
 
 // FSK tones
-#define FREQ_MARK   15000.0f
-#define FREQ_SPACE  17000.0f
+//#define FREQ_MARK   15000.0f
+//#define FREQ_SPACE  17000.0f
+
+//audiable range
+#define FREQ_MARK   6000.0f
+#define FREQ_SPACE  8000.0f
 
 #define BAUD_RATE   100
 #define SAMPLE_RATE 44100.0f
@@ -180,7 +184,7 @@ uint16_t rxCrc = 0;
 uint8_t rxCrcHi = 0;
 uint32_t frameStartMs = 0;
 
-static const uint32_t FRAME_TIMEOUT_MS = 2000;  // Increased from 500ms
+static const uint32_t FRAME_TIMEOUT_MS = 5000;  // the packet timeout 
 
 void resetFrameParser() {
   rxState = RX_SEARCH_PREAMBLE;

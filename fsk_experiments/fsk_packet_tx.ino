@@ -12,8 +12,12 @@ AudioConnection      patchCord1(fskOsc, 0, i2s1, 0);
 AudioConnection      patchCord2(fskOsc, 0, i2s1, 1);
 
 // FSK tones
-#define FREQ_MARK   15000
-#define FREQ_SPACE  17000
+//#define FREQ_MARK   15000
+//#define FREQ_SPACE  17000
+
+//audible tones
+#define FREQ_MARK   6000
+#define FREQ_SPACE  8000
 
 // Bit rate
 #define BAUD_RATE   100
