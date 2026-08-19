@@ -79,6 +79,10 @@ void sendFrame(const uint8_t* payload, uint8_t len) {
 
   uint16_t crc = crc16_ccitt_false(crcInput, 1 + len);
 
+  // Print frame start with timestamp
+  uint32_t t0 = millis();
+  Serial.printf("FRAME_START: TX size=%d start=%lu ms\n", len, t0);
+
   sendPreamble();
   sendByte(START_SYNC);
   sendByte(len);
@@ -90,12 +94,16 @@ void sendFrame(const uint8_t* payload, uint8_t len) {
   sendByte((crc >> 8) & 0xFF);
   sendByte(crc & 0xFF);
   sendByte(END_SYNC);
+
+  // Print frame end with elapsed time
+  uint32_t elapsed = millis() - t0;
+  Serial.printf("FRAME_END: TX size=%d elapsed=%lu ms\n", len, elapsed);
 }
 
 void setup() {
   AudioMemory(16);
   fskOsc.begin(WAVEFORM_SINE);
-  fskOsc.amplitude(0.5f);
+  fskOsc.amplitude(0.1f);
 
   Serial.begin(115200);
   while (!Serial && millis() < 2000) {}

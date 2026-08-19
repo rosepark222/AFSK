@@ -1,12 +1,12 @@
 #include <Audio.h>
 #include <arm_math.h>
 
-// ──────────────────────────────────────────────────────────────────[...]
+// ────────────────────────────────────────────────────────────────────
 // FSK Packet RX
 // Frame format:
 //   [4-byte preamble][1-byte start sync][1-byte size][payload][2-byte CRC][1-byte end sync]
 // RX continuously demodulates and performs clock recovery.
-// ──────────────────────────────────────────────────────────────────[...]
+// ────────────────────────────────────────────────────────────────────
 
 enum DemodMethod { DEMOD_GOERTZEL_IIR, DEMOD_FFT_SLIDING };
 const DemodMethod DEMOD_SELECT = DEMOD_GOERTZEL_IIR;
@@ -79,7 +79,7 @@ struct IQDetector {
 
 IQDetector markDet, spaceDet;
 
-// ─── Clock recovery ────────────────────────────────────────────────────────[...]
+// ─── Clock recovery ────────────────────────────────────────────────────────
 const int SAMPLES_PER_BIT = (int)(SAMPLE_RATE / BAUD_RATE);
 int clockCounter = 0;
 int lastSoft = -1;
@@ -107,7 +107,7 @@ int clockRecovery(int softBit) {
   return committed;
 }
 
-// ─── CRC ─────────────────────────────────────────────────────────────[...]
+// ─── CRC ─────────────────────────────────────────────────────────────
 uint16_t crc16_ccitt_false_update(uint16_t crc, uint8_t data) {
   crc ^= ((uint16_t)data) << 8;
   for (uint8_t b = 0; b < 8; b++) {
@@ -186,6 +186,16 @@ uint32_t frameStartMs = 0;
 
 static const uint32_t FRAME_TIMEOUT_MS = 5000;  // the packet timeout 
 
+// Sliding 8-bit window of most recent committed bits (MSB oldest, LSB newest).
+// Used to detect START_SYNC on any bit boundary.
+uint8_t recentBits = 0;
+
+// For preamble (0x55 repeated) detection at bit level:
+// track last committed bit and count of consecutive alternating bits seen.
+int lastCommittedBit = -1;
+int altBitCount = 0;
+const int PREAMBLE_BITS_REQUIRED = PREAMBLE_LEN * 8;
+
 void resetFrameParser() {
   rxState = RX_SEARCH_PREAMBLE;
   preambleMatch = 0;
@@ -194,6 +204,9 @@ void resetFrameParser() {
   rxCrc = 0;
   rxCrcHi = 0;
   assembler.reset();
+  recentBits = 0;             // reset sliding window
+  lastCommittedBit = -1;
+  altBitCount = 0;
   frameStartMs = millis();
   Serial.printf("[RESET] State -> %s, frameStartMs=%lu\n", stateNames[rxState], frameStartMs);
 }
@@ -203,6 +216,12 @@ void rejectFrame(const char* reason) {
   Serial.printf("FRAME_REJECT: %s (State: %s, elapsed: %lu ms, bytes: %lu)\n", 
     reason, stateNames[rxState], elapsed, debugByteCount);
   resetFrameParser();
+}
+
+void blinkPacketOK() {
+  digitalWriteFast(LED_BUILTIN, HIGH);
+  delay(80);
+  digitalWriteFast(LED_BUILTIN, LOW);
 }
 
 void acceptFrame() {
@@ -229,6 +248,7 @@ void acceptFrame() {
   }
   Serial.println("\"");
 
+  blinkPacketOK();
   resetFrameParser();
 }
 
@@ -323,8 +343,11 @@ void processByte(uint8_t b) {
   Serial.println();
 }
 
-// ─── Setup/Loop ─────────────────────────────────────────────────────────[...]
+// ─── Setup/Loop ─────────────────────────────────────────────────────────
 void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWriteFast(LED_BUILTIN, LOW);
+
   Serial.begin(115200);
   while (!Serial && millis() < 3000) {}
 
@@ -365,6 +388,52 @@ void loop() {
       int committed = clockRecovery(softBit);
       if (committed != -1) {
         debugBitCount++;
+
+        // Update sliding 8-bit window (MSB oldest, LSB newest)
+        recentBits = (uint8_t)(((recentBits << 1) | (committed & 0x01)) & 0xFF);
+
+        // --- Bit-level alternating-run detection for preamble (0x55 repeated) ---
+        // Track alternation of bits: 0x55 is an alternating pattern (01010101).
+        if (lastCommittedBit == -1) {
+          lastCommittedBit = committed;
+          altBitCount = 1;
+        } else {
+          if (committed != lastCommittedBit) {
+            altBitCount++;
+            lastCommittedBit = committed;
+          } else {
+            // same bit twice breaks alternation; start new count from this bit
+            altBitCount = 1;
+            lastCommittedBit = committed;
+          }
+        }
+
+        // Only declare PREAMBLE when:
+        //  - we've seen enough alternating bits, AND
+        //  - the current 8-bit sliding window equals PREAMBLE_BYTE (0x55)
+        if (rxState == RX_SEARCH_PREAMBLE && altBitCount >= PREAMBLE_BITS_REQUIRED && recentBits == PREAMBLE_BYTE) {
+          Serial.printf("[SLIDING] PREAMBLE detected (altBits=%d, recentBits=0x%02X) -> SYNC\n", altBitCount, recentBits);
+          rxState = RX_SEARCH_SYNC;
+          preambleMatch = PREAMBLE_LEN; // indicate we've effectively matched the preamble
+          assembler.reset();            // align assembler so next bits build START_SYNC
+          recentBits = 0;               // start fresh for START_SYNC detection
+          frameStartMs = millis();      // mark frame start time here
+          // Do NOT push this bit into assembler because it belongs to the preamble
+          continue;
+        }
+
+        // Sliding START_SYNC detection: check on every committed bit while searching for sync.
+        // If detected, align assembler so next bits form SIZE byte.
+        if (rxState == RX_SEARCH_SYNC && recentBits == START_SYNC) {
+          Serial.printf("[SLIDING] START_SYNC detected (recentBits=0x%02X) -> SIZE\n", recentBits);
+          rxState = RX_READ_SIZE;
+          assembler.reset();   // align assembler so subsequent bits build the size byte
+          // Reset preambleMatch so future preamble failures are handled normally
+          preambleMatch = 0;
+          // Do NOT push this committed bit into assembler because it was part of START_SYNC
+          continue;
+        }
+
         uint8_t byteVal;
         if (assembler.pushBit(committed, byteVal)) {
           processByte(byteVal);
