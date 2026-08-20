@@ -52,6 +52,7 @@ void setup()
     Serial.begin(9600);
     while (!Serial) { delay(10); }
 
+#ifdef FILE_DUMP
     // --- SD init ---
     Serial.println("Initializing SD card...");
     if (!SD.begin(BUILTIN_SDCARD)) {
@@ -77,6 +78,7 @@ void setup()
 
     // --- Prepare rx file ---
     if (SD.exists("rx_chirp.txt")) SD.remove("rx_chirp.txt");
+#endif
 
     // --- Audio init ---
     AudioMemory(160);
@@ -90,26 +92,32 @@ void loop()
 {
     if (capture_done) return;
 
+#ifdef FILE_DUMP
     // Open file in append mode each loop to keep writes incremental
     File rxFile = SD.open("rx_chirp.txt", FILE_WRITE);
     if (!rxFile) {
         Serial.println("ERROR: Cannot open rx_chirp.txt. Halting.");
         while (1) {}
     }
+#endif
 
     while (queue1.available() && capture_idx < CAPTURE_SAMPLES) {
         int16_t *data = queue1.readBuffer();
 
         for (int i = 0; i < AUDIO_BLOCK_SAMPLES && capture_idx < CAPTURE_SAMPLES; i++) {
             float v = data[i] / 32768.0f;
+#ifdef FILE_DUMP
             rxFile.println(v, 6);
+#endif
             capture_idx++;
         }
 
         queue1.freeBuffer();
     }
 
+#ifdef FILE_DUMP
     rxFile.close();
+#endif
 
     // Progress report every ~0.5 s
     static int last_pct = -1;
