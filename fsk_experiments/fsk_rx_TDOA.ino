@@ -3,9 +3,10 @@
 // Mark: 6000 Hz | Space: 8000 Hz | Baud: 100
 // Detects preamble (0x55 alternating pattern) on both channels
 // Measures time delay of arrival (TDOA) between mics
-// Output: Direction in samples (-13 to +13)
-//   Positive = sound closer to LEFT mic
-//   Negative = sound closer to RIGHT mic
+// Output: Direction in degrees (-90 to +90)
+//   0° = sound in center (equidistant from both mics)
+//   +90° = sound at LEFT mic
+//   -90° = sound at RIGHT mic
 // ============================================================
 
 #include <Audio.h>
@@ -33,6 +34,7 @@ static const uint8_t PREAMBLE_LEN  = 4;
 static const int PREAMBLE_BITS_REQUIRED = PREAMBLE_LEN * 8;  // 32 bits of alternation
 
 static const int MAX_TDOA_SAMPLES = 13;  // Max direction range: -13 to +13 samples
+static const float MAX_ANGLE = 90.0f;    // Max angle: ±90 degrees
 
 // ── I/Q tone detector ────────────────────────────────────────
 struct IQDetector {
@@ -161,8 +163,15 @@ PreambleDetector preambleDet_L, preambleDet_R;
 // ── Global state ─────────────────────────────────────────────
 uint32_t blockCount = 0;
 uint32_t lastReportMs = 0;
-const uint32_t REPORT_INTERVAL_MS = 500;
-int32_t lastTDOA = 0;  // Store the last measured TDOA direction
+const uint32_t REPORT_INTERVAL_MS = 100;  // Print every 100ms
+int32_t lastTDOA_samples = 0;  // Store the last measured TDOA in samples
+float lastTDOA_degrees = 0.0f;  // Store the last measured TDOA in degrees
+
+// ── Helper function to convert TDOA samples to degrees ──────
+float samplesToDegrees(int32_t tdoa_samples) {
+  // Linear mapping: -13 samples = -90°, 0 samples = 0°, +13 samples = +90°
+  return (float)tdoa_samples * (MAX_ANGLE / MAX_TDOA_SAMPLES);
+}
 
 // ── Setup ────────────────────────────────────────────────────
 void setup() {
@@ -184,6 +193,7 @@ void setup() {
   Serial.println("========================================");
   Serial.printf("MARK=%d Hz, SPACE=%d Hz\n", (int)MARK_HZ, (int)SPACE_HZ);
   Serial.printf("Sample Rate=%d Hz\n", (int)SAMPLE_RATE);
+  Serial.println("Max TDOA range: ±13 samples (-90° to +90°)\n");
   Serial.println("Waiting for preamble...\n");
 }
 
@@ -244,22 +254,15 @@ void loop() {
         direction = -MAX_TDOA_SAMPLES;
       }
       
-      // Store the latest TDOA for stats display
-      lastTDOA = direction;
+      // Store the latest TDOA
+      lastTDOA_samples = direction;
+      lastTDOA_degrees = samplesToDegrees(direction);
       
       Serial.println("\n========================================");
       Serial.printf("TDOA RESULT:\n");
       Serial.printf("  LEFT  detected at sample:  %ld\n", preambleDet_L.preambleDetectedSampleIndex);
       Serial.printf("  RIGHT detected at sample:  %ld\n", preambleDet_R.preambleDetectedSampleIndex);
-      Serial.printf("  DIRECTION: %ld samples\n", direction);
-      Serial.printf("  Interpretation: ");
-      if (direction > 0) {
-        Serial.printf("Sound CLOSER to LEFT mic (+%ld samples)\n", direction);
-      } else if (direction < 0) {
-        Serial.printf("Sound CLOSER to RIGHT mic (%ld samples)\n", direction);
-      } else {
-        Serial.printf("Sound EQUIDISTANT (0 samples)\n");
-      }
+      Serial.printf("  TDOA: %ld samples | %.1f degrees\n", direction, lastTDOA_degrees);
       Serial.println("========================================\n");
 
       // Reset for next packet
@@ -273,12 +276,10 @@ void loop() {
   queue_left.freeBuffer();
   queue_right.freeBuffer();
 
-  // Debug stats every 500ms
+  // Continuous TDOA output every 100ms
   uint32_t now = millis();
   if (now - lastReportMs >= REPORT_INTERVAL_MS) {
     lastReportMs = now;
-    Serial.printf("[STATS] Blocks: %lu | TDOA: %ld samples\n",
-      blockCount,
-      lastTDOA);
+    Serial.printf("[DIRECTION] %ld samples | %.1f degrees\n", lastTDOA_samples, lastTDOA_degrees);
   }
 }
