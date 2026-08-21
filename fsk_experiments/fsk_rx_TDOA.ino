@@ -162,10 +162,6 @@ PreambleDetector preambleDet_L, preambleDet_R;
 
 // ── Global state ─────────────────────────────────────────────
 uint32_t blockCount = 0;
-uint32_t lastReportMs = 0;
-const uint32_t REPORT_INTERVAL_MS = 100;  // Print every 100ms
-int32_t lastTDOA_samples = 0;  // Store the last measured TDOA in samples
-float lastTDOA_degrees = 0.0f;  // Store the last measured TDOA in degrees
 
 // ── Helper function to convert TDOA samples to degrees ──────
 float samplesToDegrees(int32_t tdoa_samples) {
@@ -193,7 +189,7 @@ void setup() {
   Serial.println("========================================");
   Serial.printf("MARK=%d Hz, SPACE=%d Hz\n", (int)MARK_HZ, (int)SPACE_HZ);
   Serial.printf("Sample Rate=%d Hz\n", (int)SAMPLE_RATE);
-  Serial.println("Max TDOA range: ±13 samples (-90° to +90°)\n");
+  Serial.println("Direction range: ±13 samples (-90° to +90°)\n");
   Serial.println("Waiting for preamble...\n");
 }
 
@@ -254,15 +250,15 @@ void loop() {
         direction = -MAX_TDOA_SAMPLES;
       }
       
-      // Store the latest TDOA
-      lastTDOA_samples = direction;
-      lastTDOA_degrees = samplesToDegrees(direction);
+      // Convert to degrees
+      float direction_degrees = samplesToDegrees(direction);
       
       Serial.println("\n========================================");
-      Serial.printf("TDOA RESULT:\n");
-      Serial.printf("  LEFT  detected at sample:  %ld\n", preambleDet_L.preambleDetectedSampleIndex);
-      Serial.printf("  RIGHT detected at sample:  %ld\n", preambleDet_R.preambleDetectedSampleIndex);
-      Serial.printf("  TDOA: %ld samples | %.1f degrees\n", direction, lastTDOA_degrees);
+      Serial.printf("PREAMBLE DETECTED:\n");
+      Serial.printf("  LEFT  sample index:   %ld\n", preambleDet_L.preambleDetectedSampleIndex);
+      Serial.printf("  RIGHT sample index:   %ld\n", preambleDet_R.preambleDetectedSampleIndex);
+      Serial.printf("  TDOA: %ld samples\n", direction);
+      Serial.printf("  DIRECTION: %.1f degrees\n", direction_degrees);
       Serial.println("========================================\n");
 
       // Reset for next packet
@@ -275,11 +271,4 @@ void loop() {
 
   queue_left.freeBuffer();
   queue_right.freeBuffer();
-
-  // Continuous TDOA output every 100ms
-  uint32_t now = millis();
-  if (now - lastReportMs >= REPORT_INTERVAL_MS) {
-    lastReportMs = now;
-    Serial.printf("[DIRECTION] %ld samples | %.1f degrees\n", lastTDOA_samples, lastTDOA_degrees);
-  }
 }
