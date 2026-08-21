@@ -36,6 +36,11 @@ static const int PREAMBLE_BITS_REQUIRED = PREAMBLE_LEN * 8;  // 32 bits of alter
 static const int MAX_TDOA_SAMPLES = 13;  // Max direction range: -13 to +13 samples
 static const float MAX_ANGLE = 90.0f;    // Max angle: ±90 degrees
 
+// ── Time window validation ──────────────────────────────────
+// For 4-inch (10cm) mic spacing, max realistic TDOA is ~9.5 samples (~2.2ms)
+// We use 100 samples (~2.3ms) as safety threshold for same-event detection
+static const int MAX_TDOA_TIME_WINDOW = 100;  // samples at 44.1kHz
+
 // ── I/Q tone detector ────────────────────────────────────────
 struct IQDetector {
   float phaseInc;
@@ -189,6 +194,8 @@ void setup() {
   Serial.println("========================================");
   Serial.printf("MARK=%d Hz, SPACE=%d Hz\n", (int)MARK_HZ, (int)SPACE_HZ);
   Serial.printf("Sample Rate=%d Hz\n", (int)SAMPLE_RATE);
+  Serial.printf("Time window: ±%d samples (%.1f ms)\n", MAX_TDOA_TIME_WINDOW, 
+                (MAX_TDOA_TIME_WINDOW * 1000.0f / SAMPLE_RATE));
   Serial.println("Direction range: ±13 samples (-90° to +90°)\n");
   Serial.println("Waiting for preamble...\n");
 }
@@ -238,34 +245,54 @@ void loop() {
 
     // ── Check if both preambles detected, calculate TDOA ──
     if (preambleDet_L.preambleFound && preambleDet_R.preambleFound) {
-      // Direction = LEFT_sample - RIGHT_sample
-      // Positive = sound closer to LEFT mic
-      // Negative = sound closer to RIGHT mic
-      int32_t direction = preambleDet_L.preambleDetectedSampleIndex - preambleDet_R.preambleDetectedSampleIndex;
+      // ── TIME WINDOW VALIDATION ──
+      // Check if detections are within realistic time window for 4-inch mic spacing
+      int32_t sample_diff = abs((int32_t)(preambleDet_L.preambleDetectedSampleIndex - 
+                                          preambleDet_R.preambleDetectedSampleIndex));
       
-      // Clamp direction to -13 to +13 sample range
-      if (direction > MAX_TDOA_SAMPLES) {
-        direction = MAX_TDOA_SAMPLES;
-      } else if (direction < -MAX_TDOA_SAMPLES) {
-        direction = -MAX_TDOA_SAMPLES;
-      }
-      
-      // Convert to degrees
-      float direction_degrees = samplesToDegrees(direction);
-      
-      Serial.println("\n========================================");
-      Serial.printf("PREAMBLE DETECTED:\n");
-      Serial.printf("  LEFT  sample index:   %ld\n", preambleDet_L.preambleDetectedSampleIndex);
-      Serial.printf("  RIGHT sample index:   %ld\n", preambleDet_R.preambleDetectedSampleIndex);
-      Serial.printf("  TDOA: %ld samples\n", direction);
-      Serial.printf("  DIRECTION: %.1f degrees\n", direction_degrees);
-      Serial.println("========================================\n");
+      if (sample_diff > MAX_TDOA_TIME_WINDOW) {
+        // Detections are too far apart in time — they're from different events
+        Serial.printf("[REJECT] Sample difference too large: %ld samples (threshold: %d)\n", 
+                      sample_diff, MAX_TDOA_TIME_WINDOW);
+        Serial.println("         Likely two separate transmissions, not TDOA\n");
+        
+        // Reset and wait for next detection
+        preambleDet_L.reset();
+        preambleDet_R.reset();
+        clockRec_L.reset();
+        clockRec_R.reset();
+      } else {
+        // Valid TDOA detection
+        // Direction = LEFT_sample - RIGHT_sample
+        // Positive = sound closer to LEFT mic
+        // Negative = sound closer to RIGHT mic
+        int32_t direction = preambleDet_L.preambleDetectedSampleIndex - preambleDet_R.preambleDetectedSampleIndex;
+        
+        // Clamp direction to -13 to +13 sample range
+        if (direction > MAX_TDOA_SAMPLES) {
+          direction = MAX_TDOA_SAMPLES;
+        } else if (direction < -MAX_TDOA_SAMPLES) {
+          direction = -MAX_TDOA_SAMPLES;
+        }
+        
+        // Convert to degrees
+        float direction_degrees = samplesToDegrees(direction);
+        
+        Serial.println("\n========================================");
+        Serial.printf("PREAMBLE DETECTED:\n");
+        Serial.printf("  LEFT  sample index:   %ld\n", preambleDet_L.preambleDetectedSampleIndex);
+        Serial.printf("  RIGHT sample index:   %ld\n", preambleDet_R.preambleDetectedSampleIndex);
+        Serial.printf("  Sample difference:    %ld samples\n", direction);
+        Serial.printf("  TDOA: %ld samples\n", direction);
+        Serial.printf("  DIRECTION: %.1f degrees\n", direction_degrees);
+        Serial.println("========================================\n");
 
-      // Reset for next packet
-      preambleDet_L.reset();
-      preambleDet_R.reset();
-      clockRec_L.reset();
-      clockRec_R.reset();
+        // Reset for next packet
+        preambleDet_L.reset();
+        preambleDet_R.reset();
+        clockRec_L.reset();
+        clockRec_R.reset();
+      }
     }
   }
 
