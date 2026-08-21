@@ -32,6 +32,8 @@ static const uint8_t PREAMBLE_BYTE = 0x55;  // 01010101 — alternating pattern
 static const uint8_t PREAMBLE_LEN  = 4;
 static const int PREAMBLE_BITS_REQUIRED = PREAMBLE_LEN * 8;  // 32 bits of alternation
 
+static const int MAX_TDOA_SAMPLES = 13;  // Max direction range: -13 to +13 samples
+
 // ── I/Q tone detector ────────────────────────────────────────
 struct IQDetector {
   float phaseInc;
@@ -233,6 +235,13 @@ void loop() {
       // Positive = sound closer to LEFT mic
       // Negative = sound closer to RIGHT mic
       int32_t direction = preambleDet_L.preambleDetectedSampleIndex - preambleDet_R.preambleDetectedSampleIndex;
+      
+      // Clamp direction to -13 to +13 sample range
+      if (direction > MAX_TDOA_SAMPLES) {
+        direction = MAX_TDOA_SAMPLES;
+      } else if (direction < -MAX_TDOA_SAMPLES) {
+        direction = -MAX_TDOA_SAMPLES;
+      }
       
       Serial.println("\n========================================");
       Serial.printf("TDOA RESULT:\n");
