@@ -3,8 +3,9 @@
 // Mark: 6000 Hz | Space: 8000 Hz | Baud: 100
 // Detects preamble (0x55 alternating pattern) on both channels
 // Measures time delay of arrival (TDOA) between mics
-// Positive delay = sound closer to LEFT mic
-// Negative delay = sound closer to RIGHT mic
+// Output: Direction in samples (-13 to +13)
+//   Positive = sound closer to LEFT mic
+//   Negative = sound closer to RIGHT mic
 // ============================================================
 
 #include <Audio.h>
@@ -228,21 +229,21 @@ void loop() {
 
     // ── Check if both preambles detected, calculate TDOA ──
     if (preambleDet_L.preambleFound && preambleDet_R.preambleFound) {
-      int32_t delta_samples = preambleDet_R.preambleDetectedSampleIndex - preambleDet_L.preambleDetectedSampleIndex;
+      // Direction = LEFT_sample - RIGHT_sample
+      // Positive = sound closer to LEFT mic
+      // Negative = sound closer to RIGHT mic
+      int32_t direction = preambleDet_L.preambleDetectedSampleIndex - preambleDet_R.preambleDetectedSampleIndex;
       
-      // Interpretation:
-      //  delta_samples > 0: RIGHT detected later → sound closer to LEFT
-      //  delta_samples < 0: LEFT detected later → sound closer to RIGHT
       Serial.println("\n========================================");
       Serial.printf("TDOA RESULT:\n");
       Serial.printf("  LEFT  detected at sample:  %ld\n", preambleDet_L.preambleDetectedSampleIndex);
       Serial.printf("  RIGHT detected at sample:  %ld\n", preambleDet_R.preambleDetectedSampleIndex);
-      Serial.printf("  Sample delay (LEFT - RIGHT): %ld samples\n", -delta_samples);
+      Serial.printf("  DIRECTION: %ld samples\n", direction);
       Serial.printf("  Interpretation: ");
-      if (delta_samples > 0) {
-        Serial.printf("Sound CLOSER to LEFT mic (+%ld samples)\n", delta_samples);
-      } else if (delta_samples < 0) {
-        Serial.printf("Sound CLOSER to RIGHT mic (%ld samples)\n", delta_samples);
+      if (direction > 0) {
+        Serial.printf("Sound CLOSER to LEFT mic (+%ld samples)\n", direction);
+      } else if (direction < 0) {
+        Serial.printf("Sound CLOSER to RIGHT mic (%ld samples)\n", direction);
       } else {
         Serial.printf("Sound EQUIDISTANT (0 samples)\n");
       }
