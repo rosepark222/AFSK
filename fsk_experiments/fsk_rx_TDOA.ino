@@ -162,6 +162,7 @@ PreambleDetector preambleDet_L, preambleDet_R;
 uint32_t blockCount = 0;
 uint32_t lastReportMs = 0;
 const uint32_t REPORT_INTERVAL_MS = 500;
+int32_t lastTDOA = 0;  // Store the last measured TDOA direction
 
 // ── Setup ────────────────────────────────────────────────────
 void setup() {
@@ -243,6 +244,9 @@ void loop() {
         direction = -MAX_TDOA_SAMPLES;
       }
       
+      // Store the latest TDOA for stats display
+      lastTDOA = direction;
+      
       Serial.println("\n========================================");
       Serial.printf("TDOA RESULT:\n");
       Serial.printf("  LEFT  detected at sample:  %ld\n", preambleDet_L.preambleDetectedSampleIndex);
@@ -273,9 +277,8 @@ void loop() {
   uint32_t now = millis();
   if (now - lastReportMs >= REPORT_INTERVAL_MS) {
     lastReportMs = now;
-    Serial.printf("[STATS] Blocks: %lu | L_found: %s | R_found: %s\n",
+    Serial.printf("[STATS] Blocks: %lu | TDOA: %ld samples\n",
       blockCount,
-      preambleDet_L.preambleFound ? "YES" : "no",
-      preambleDet_R.preambleFound ? "YES" : "no");
+      lastTDOA);
   }
 }
