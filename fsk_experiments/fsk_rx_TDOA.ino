@@ -38,12 +38,8 @@ static const float MAX_ANGLE = 90.0f;    // Max angle: ±90 degrees
 
 // ── Time window validation ──────────────────────────────────
 // For 4-inch (10cm) mic spacing, max realistic TDOA is ~9.5 samples (~2.2ms)
-// We use 100 samples (~2.3ms) as safety threshold for same-event detection
-static const int MAX_TDOA_TIME_WINDOW = 100;  // samples at 44.1kHz
-
-// ── Global system sample counter ─────────────────────────────
-// Single time reference across both channels (incremented per audio sample)
-static int32_t globalSystemSampleCounter = 0;
+// We use 5 milliseconds as safety threshold for same-event detection
+static const uint32_t MAX_TDOA_TIME_WINDOW_US = 5000;  // microseconds (~2.3ms for 4-inch spacing)
 
 // ── I/Q tone detector ────────────────────────────────────────
 struct IQDetector {
@@ -123,20 +119,20 @@ struct PreambleDetector {
   int lastCommittedBit = -1;
   int altBitCount = 0;
   uint8_t recentBits = 0;
-  int32_t preambleDetectedSampleIndex = -1;  // Global system sample index when preamble was detected
+  uint32_t preambleDetectedTimeUs = 0;  // Wall-clock timestamp (microseconds) when preamble was detected
   bool preambleFound = false;
 
   void reset() {
     lastCommittedBit = -1;
     altBitCount = 0;
     recentBits = 0;
-    preambleDetectedSampleIndex = -1;
+    preambleDetectedTimeUs = 0;
     preambleFound = false;
   }
 
   // Returns true if preamble just detected in this call
-  // globalSampleIndex: Common system time reference (same across both channels)
-  bool processBit(int committed, int32_t globalSampleIndex) {
+  // wallClockTimeUs: Wall-clock time in microseconds (same reference for both channels)
+  bool processBit(int committed, uint32_t wallClockTimeUs) {
     if (preambleFound) return false;  // Already found, don't detect again
 
     // Update sliding 8-bit window (MSB oldest, LSB newest)
@@ -159,7 +155,7 @@ struct PreambleDetector {
 
     // Preamble detected: enough alternating bits + window matches 0x55
     if (altBitCount >= PREAMBLE_BITS_REQUIRED && recentBits == PREAMBLE_BYTE) {
-      preambleDetectedSampleIndex = globalSampleIndex;  // Store GLOBAL timestamp
+      preambleDetectedTimeUs = wallClockTimeUs;  // Store wall-clock timestamp
       preambleFound = true;
       return true;
     }
@@ -173,10 +169,14 @@ PreambleDetector preambleDet_L, preambleDet_R;
 // ── Global state ─────────────────────────────────────────────
 uint32_t blockCount = 0;
 
-// ── Helper function to convert TDOA samples to degrees ──────
-float samplesToDegrees(int32_t tdoa_samples) {
-  // Linear mapping: -13 samples = -90°, 0 samples = 0°, +13 samples = +90°
-  return (float)tdoa_samples * (MAX_ANGLE / MAX_TDOA_SAMPLES);
+// ── Helper function to convert time delay to degrees ──────
+// For 4-inch (10cm) spacing: max delay ≈ 0.296 ms (290 µs) = ±90°
+float timeDeltaToDegrees(int32_t timeDelta_us) {
+  // Sound speed: 343 m/s = 343e-6 m/µs
+  // 4 inches = 0.1016 m
+  // Max delay: 0.1016 / 343e-6 ≈ 296 µs
+  static const float MAX_TIME_DELTA_US = 300.0f;  // µs, approximately ±90°
+  return (float)timeDelta_us * (MAX_ANGLE / MAX_TIME_DELTA_US);
 }
 
 // ── Setup ────────────────────────────────────────────────────
@@ -199,9 +199,8 @@ void setup() {
   Serial.println("========================================");
   Serial.printf("MARK=%d Hz, SPACE=%d Hz\n", (int)MARK_HZ, (int)SPACE_HZ);
   Serial.printf("Sample Rate=%d Hz\n", (int)SAMPLE_RATE);
-  Serial.printf("Time window: ±%d samples (%.1f ms)\n", MAX_TDOA_TIME_WINDOW, 
-                (MAX_TDOA_TIME_WINDOW * 1000.0f / SAMPLE_RATE));
-  Serial.println("Direction range: ±13 samples (-90° to +90°)\n");
+  Serial.printf("Time window: ±%d µs (for 4-inch spacing)\n", MAX_TDOA_TIME_WINDOW_US);
+  Serial.println("Direction range: ±90° (based on sound arrival time)\n");
   Serial.println("Waiting for preamble...\n");
 }
 
@@ -218,10 +217,9 @@ void loop() {
 
   // Process each sample in the block
   for (int i = 0; i < BLOCK_SIZE; i++) {
-    // ── GLOBAL SYSTEM TIME REFERENCE ──
-    // Single counter for both channels, incremented once per audio sample
-    int32_t globalSampleIndex = globalSystemSampleCounter;
-    globalSystemSampleCounter++;
+    // ── WALL-CLOCK TIME REFERENCE ──
+    // Get current microseconds (same for both channels at this iteration)
+    uint32_t wallClockTimeUs = micros();
 
     // ── LEFT CHANNEL ──
     float x_L = block_L[i] / 32768.0f;
@@ -231,10 +229,10 @@ void loop() {
     int committed_L = clockRec_L.process(softBit_L);
 
     if (committed_L != -1) {
-      // Pass GLOBAL timestamp (same reference for both channels)
-      bool preamble_L_detected = preambleDet_L.processBit(committed_L, globalSampleIndex);
+      // Pass wall-clock timestamp (same reference for both channels)
+      bool preamble_L_detected = preambleDet_L.processBit(committed_L, wallClockTimeUs);
       if (preamble_L_detected) {
-        Serial.printf("[LEFT]  Preamble detected at global sample index: %ld\n", preambleDet_L.preambleDetectedSampleIndex);
+        Serial.printf("[LEFT]  Preamble detected at time: %lu µs\n", preambleDet_L.preambleDetectedTimeUs);
       }
     }
 
@@ -246,10 +244,10 @@ void loop() {
     int committed_R = clockRec_R.process(softBit_R);
 
     if (committed_R != -1) {
-      // Pass SAME GLOBAL timestamp reference
-      bool preamble_R_detected = preambleDet_R.processBit(committed_R, globalSampleIndex);
+      // Pass SAME wall-clock timestamp reference
+      bool preamble_R_detected = preambleDet_R.processBit(committed_R, wallClockTimeUs);
       if (preamble_R_detected) {
-        Serial.printf("[RIGHT] Preamble detected at global sample index: %ld\n", preambleDet_R.preambleDetectedSampleIndex);
+        Serial.printf("[RIGHT] Preamble detected at time: %lu µs\n", preambleDet_R.preambleDetectedTimeUs);
       }
     }
 
@@ -257,13 +255,13 @@ void loop() {
     if (preambleDet_L.preambleFound && preambleDet_R.preambleFound) {
       // ── TIME WINDOW VALIDATION ──
       // Check if detections are within realistic time window for 4-inch mic spacing
-      int32_t sample_diff = abs((int32_t)(preambleDet_L.preambleDetectedSampleIndex - 
-                                          preambleDet_R.preambleDetectedSampleIndex));
+      int32_t time_delta_us = (int32_t)(preambleDet_L.preambleDetectedTimeUs - preambleDet_R.preambleDetectedTimeUs);
+      uint32_t abs_time_delta = (uint32_t)abs(time_delta_us);
       
-      if (sample_diff > MAX_TDOA_TIME_WINDOW) {
+      if (abs_time_delta > MAX_TDOA_TIME_WINDOW_US) {
         // Detections are too far apart in time — they're from different events
-        Serial.printf("[REJECT] Sample difference too large: %ld samples (threshold: %d)\n", 
-                      sample_diff, MAX_TDOA_TIME_WINDOW);
+        Serial.printf("[REJECT] Time difference too large: %lu µs (threshold: %lu µs)\n", 
+                      abs_time_delta, MAX_TDOA_TIME_WINDOW_US);
         Serial.println("         Likely two separate transmissions, not TDOA\n");
         
         // Reset and wait for next detection
@@ -273,26 +271,23 @@ void loop() {
         clockRec_R.reset();
       } else {
         // Valid TDOA detection
-        // Direction = LEFT_sample - RIGHT_sample
+        // Direction = LEFT_time - RIGHT_time
         // Positive = sound arrived at LEFT mic first (source on left)
         // Negative = sound arrived at RIGHT mic first (source on right)
-        int32_t direction = preambleDet_L.preambleDetectedSampleIndex - preambleDet_R.preambleDetectedSampleIndex;
-        
-        // Clamp direction to -13 to +13 sample range
-        if (direction > MAX_TDOA_SAMPLES) {
-          direction = MAX_TDOA_SAMPLES;
-        } else if (direction < -MAX_TDOA_SAMPLES) {
-          direction = -MAX_TDOA_SAMPLES;
-        }
+        int32_t time_delta = (int32_t)(preambleDet_L.preambleDetectedTimeUs - preambleDet_R.preambleDetectedTimeUs);
         
         // Convert to degrees
-        float direction_degrees = samplesToDegrees(direction);
+        float direction_degrees = timeDeltaToDegrees(time_delta);
+        
+        // Clamp to ±90°
+        if (direction_degrees > MAX_ANGLE) direction_degrees = MAX_ANGLE;
+        if (direction_degrees < -MAX_ANGLE) direction_degrees = -MAX_ANGLE;
         
         Serial.println("\n========================================");
-        Serial.printf("PREAMBLE DETECTED (Synchronized TDOA):\n");
-        Serial.printf("  LEFT  global sample index:  %ld\n", preambleDet_L.preambleDetectedSampleIndex);
-        Serial.printf("  RIGHT global sample index:  %ld\n", preambleDet_R.preambleDetectedSampleIndex);
-        Serial.printf("  TDOA (sample difference):   %ld samples\n", direction);
+        Serial.printf("PREAMBLE DETECTED (Wall-Clock TDOA):\n");
+        Serial.printf("  LEFT  detection time:   %lu µs\n", preambleDet_L.preambleDetectedTimeUs);
+        Serial.printf("  RIGHT detection time:   %lu µs\n", preambleDet_R.preambleDetectedTimeUs);
+        Serial.printf("  Time difference:        %ld µs\n", time_delta);
         Serial.printf("  DIRECTION: %.1f degrees\n", direction_degrees);
         Serial.printf("  (Positive = LEFT mic first, Negative = RIGHT mic first)\n");
         Serial.println("========================================\n");
