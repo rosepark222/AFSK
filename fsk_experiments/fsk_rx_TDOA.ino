@@ -41,6 +41,10 @@ static const float MAX_ANGLE = 90.0f;    // Max angle: ±90 degrees
 // We use 100 samples (~2.3ms) as safety threshold for same-event detection
 static const int MAX_TDOA_TIME_WINDOW = 100;  // samples at 44.1kHz
 
+// ── Global system sample counter ─────────────────────────────
+// Single time reference across both channels (incremented per audio sample)
+static int32_t globalSystemSampleCounter = 0;
+
 // ── I/Q tone detector ────────────────────────────────────────
 struct IQDetector {
   float phaseInc;
@@ -119,7 +123,7 @@ struct PreambleDetector {
   int lastCommittedBit = -1;
   int altBitCount = 0;
   uint8_t recentBits = 0;
-  int32_t preambleDetectedSampleIndex = -1;  // Sample index when preamble was detected
+  int32_t preambleDetectedSampleIndex = -1;  // Global system sample index when preamble was detected
   bool preambleFound = false;
 
   void reset() {
@@ -131,7 +135,8 @@ struct PreambleDetector {
   }
 
   // Returns true if preamble just detected in this call
-  bool processBit(int committed, int32_t sampleIndex) {
+  // globalSampleIndex: Common system time reference (same across both channels)
+  bool processBit(int committed, int32_t globalSampleIndex) {
     if (preambleFound) return false;  // Already found, don't detect again
 
     // Update sliding 8-bit window (MSB oldest, LSB newest)
@@ -154,7 +159,7 @@ struct PreambleDetector {
 
     // Preamble detected: enough alternating bits + window matches 0x55
     if (altBitCount >= PREAMBLE_BITS_REQUIRED && recentBits == PREAMBLE_BYTE) {
-      preambleDetectedSampleIndex = sampleIndex;
+      preambleDetectedSampleIndex = globalSampleIndex;  // Store GLOBAL timestamp
       preambleFound = true;
       return true;
     }
@@ -213,7 +218,10 @@ void loop() {
 
   // Process each sample in the block
   for (int i = 0; i < BLOCK_SIZE; i++) {
-    int32_t sampleIndex = (blockCount - 1) * BLOCK_SIZE + i;
+    // ── GLOBAL SYSTEM TIME REFERENCE ──
+    // Single counter for both channels, incremented once per audio sample
+    int32_t globalSampleIndex = globalSystemSampleCounter;
+    globalSystemSampleCounter++;
 
     // ── LEFT CHANNEL ──
     float x_L = block_L[i] / 32768.0f;
@@ -223,9 +231,10 @@ void loop() {
     int committed_L = clockRec_L.process(softBit_L);
 
     if (committed_L != -1) {
-      bool preamble_L_detected = preambleDet_L.processBit(committed_L, sampleIndex);
+      // Pass GLOBAL timestamp (same reference for both channels)
+      bool preamble_L_detected = preambleDet_L.processBit(committed_L, globalSampleIndex);
       if (preamble_L_detected) {
-        Serial.printf("[LEFT]  Preamble detected at sample index: %ld\n", preambleDet_L.preambleDetectedSampleIndex);
+        Serial.printf("[LEFT]  Preamble detected at global sample index: %ld\n", preambleDet_L.preambleDetectedSampleIndex);
       }
     }
 
@@ -237,9 +246,10 @@ void loop() {
     int committed_R = clockRec_R.process(softBit_R);
 
     if (committed_R != -1) {
-      bool preamble_R_detected = preambleDet_R.processBit(committed_R, sampleIndex);
+      // Pass SAME GLOBAL timestamp reference
+      bool preamble_R_detected = preambleDet_R.processBit(committed_R, globalSampleIndex);
       if (preamble_R_detected) {
-        Serial.printf("[RIGHT] Preamble detected at sample index: %ld\n", preambleDet_R.preambleDetectedSampleIndex);
+        Serial.printf("[RIGHT] Preamble detected at global sample index: %ld\n", preambleDet_R.preambleDetectedSampleIndex);
       }
     }
 
@@ -264,8 +274,8 @@ void loop() {
       } else {
         // Valid TDOA detection
         // Direction = LEFT_sample - RIGHT_sample
-        // Positive = sound closer to LEFT mic
-        // Negative = sound closer to RIGHT mic
+        // Positive = sound arrived at LEFT mic first (source on left)
+        // Negative = sound arrived at RIGHT mic first (source on right)
         int32_t direction = preambleDet_L.preambleDetectedSampleIndex - preambleDet_R.preambleDetectedSampleIndex;
         
         // Clamp direction to -13 to +13 sample range
@@ -279,12 +289,12 @@ void loop() {
         float direction_degrees = samplesToDegrees(direction);
         
         Serial.println("\n========================================");
-        Serial.printf("PREAMBLE DETECTED:\n");
-        Serial.printf("  LEFT  sample index:   %ld\n", preambleDet_L.preambleDetectedSampleIndex);
-        Serial.printf("  RIGHT sample index:   %ld\n", preambleDet_R.preambleDetectedSampleIndex);
-        Serial.printf("  Sample difference:    %ld samples\n", direction);
-        Serial.printf("  TDOA: %ld samples\n", direction);
+        Serial.printf("PREAMBLE DETECTED (Synchronized TDOA):\n");
+        Serial.printf("  LEFT  global sample index:  %ld\n", preambleDet_L.preambleDetectedSampleIndex);
+        Serial.printf("  RIGHT global sample index:  %ld\n", preambleDet_R.preambleDetectedSampleIndex);
+        Serial.printf("  TDOA (sample difference):   %ld samples\n", direction);
         Serial.printf("  DIRECTION: %.1f degrees\n", direction_degrees);
+        Serial.printf("  (Positive = LEFT mic first, Negative = RIGHT mic first)\n");
         Serial.println("========================================\n");
 
         // Reset for next packet
