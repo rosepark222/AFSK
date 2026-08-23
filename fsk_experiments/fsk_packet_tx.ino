@@ -1,10 +1,10 @@
 #include <Audio.h>
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────��[...]
 // FSK Packet TX
 // Frame format:
 //   [4-byte preamble][1-byte start sync][1-byte size][payload][2-byte CRC][1-byte end sync]
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────��[...]
 
 AudioSynthWaveform   fskOsc;
 AudioOutputI2S       i2s1;
@@ -29,6 +29,10 @@ static const uint8_t START_SYNC    = 0x7E;
 static const uint8_t END_SYNC      = 0x7F;
 static const uint8_t PREAMBLE_LEN  = 4;
 static const uint8_t MAX_PAYLOAD   = 254;
+
+// amplitude settings
+#define FSK_AMPLITUDE 0.10f
+#define FSK_IDLE_AMPLITUDE 0.0f
 
 // Example payload
 const uint8_t demoPayload[] = {
@@ -83,6 +87,9 @@ void sendFrame(const uint8_t* payload, uint8_t len) {
   uint32_t t0 = millis();
   Serial.printf("FRAME_START: TX size=%d start=%lu ms\n", len, t0);
 
+  // Enable audio for the duration of the frame only
+  fskOsc.amplitude(FSK_AMPLITUDE);
+
   sendPreamble();
   sendByte(START_SYNC);
   sendByte(len);
@@ -95,6 +102,9 @@ void sendFrame(const uint8_t* payload, uint8_t len) {
   sendByte(crc & 0xFF);
   sendByte(END_SYNC);
 
+  // Disable audio immediately after the frame so there's no sound between packets
+  fskOsc.amplitude(FSK_IDLE_AMPLITUDE);
+
   // Print frame end with elapsed time
   uint32_t elapsed = millis() - t0;
   Serial.printf("FRAME_END: TX size=%d elapsed=%lu ms\n", len, elapsed);
@@ -103,7 +113,8 @@ void sendFrame(const uint8_t* payload, uint8_t len) {
 void setup() {
   AudioMemory(16);
   fskOsc.begin(WAVEFORM_SINE);
-  fskOsc.amplitude(0.1f);
+  // Start silent; enable audio only while transmitting a frame
+  fskOsc.amplitude(FSK_IDLE_AMPLITUDE);
 
   Serial.begin(115200);
   while (!Serial && millis() < 2000) {}
@@ -112,5 +123,6 @@ void setup() {
 
 void loop() {
   sendFrame(demoPayload, demoPayloadLen);
+  // Oscillator is silent here because sendFrame turns amplitude off after sending
   delay(1000);
 }
