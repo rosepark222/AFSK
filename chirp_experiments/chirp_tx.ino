@@ -15,7 +15,7 @@ AudioConnection    patchCord2(queue, 0, i2s1, 1);
 #define F_START 300.0f
 #define F_END   1500.0f
 
-#define ID 5
+#define ID 0 // ID 5 causes cutoff when 1500 -> 300 transition
 #define NUM_SLOTS 16
 
 #define AMPLITUDE 0.8f // 0.25f
@@ -24,6 +24,7 @@ AudioConnection    patchCord2(queue, 0, i2s1, 1);
 int16_t chirp_buffer[N_SAMPLES];
 
 // ─── Generate CLEAN Cyclic Chirp ──────────────────────────
+// raw signal generation -- different from how fsk_tx generates using AudioSynthWaveform   
 void generateChirp()
 {
     float bandwidth = F_END - F_START;
@@ -101,5 +102,5 @@ void loop()
     playBuffer(chirp_buffer, N_SAMPLES);
 
     // Wait 1 second before playing the next chirp
-    delay(5000);
+    delay(3000);
 }
