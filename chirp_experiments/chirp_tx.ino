@@ -71,7 +71,7 @@ void playBuffer(int16_t *buf, int len)
 
         if (queue.available() > 0) {
 
-            int16_t *block = (int16_t)queue.getBuffer();
+            int16_t *block = (int16_t*)queue.getBuffer();
 
             for (int i = 0; i < AUDIO_BLOCK_SAMPLES; i++) {
 
@@ -89,7 +89,7 @@ void playBuffer(int16_t *buf, int len)
 // ─── Setup ─────────────────────────────────────────────────
 void setup()
 {
-    AudioMemory(20);
+    AudioMemory(100);
 
     generateChirp();
 }
@@ -101,5 +101,5 @@ void loop()
     playBuffer(chirp_buffer, N_SAMPLES);
 
     // Wait 1 second before playing the next chirp
-    delay(3000);
+    delay(5000);
 }
