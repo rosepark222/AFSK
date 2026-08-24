@@ -13,7 +13,7 @@ AudioConnection    patchCord2(dcBlocker, 0, queue1,  0);  // replace direct conn
 #define SAMPLE_RATE     44100
 #define CHIRP_DURATION  1.0f
 #define N_CHIRP         (int)(SAMPLE_RATE * CHIRP_DURATION)  // 44100
-#define ID              5
+#define ID              0
 #define F_START         300.0f
 #define F_END           1500.0f
 #define NUM_SLOTS       16
@@ -176,24 +176,25 @@ void loop()
           char buf[48];
           snprintf(buf, sizeof(buf), "coarse=%8.6f  %-4s", coarse, marker);
           Serial.println(buf);
+          ledBlink();
         }
 
-        // 4. Fine search — only when coarse exceeds threshold
-        if (coarse > THRESHOLD && blocks_since_detect > MIN_GAP_BLOCKS) {
+        // // 4. Fine search — only when coarse exceeds threshold
+        // if (coarse > THRESHOLD && blocks_since_detect > MIN_GAP_BLOCKS) {
 
-            int   best_offset;
-            float fine = fineSearch(best_offset);
+        //     int   best_offset;
+        //     float fine = fineSearch(best_offset);
 
-            Serial.print("  >>> FINE peak=");
-            Serial.print(fine, 6);
-            Serial.print("  offset=");
-            Serial.println(best_offset);
+        //     Serial.print("  >>> FINE peak=");
+        //     Serial.print(fine, 6);
+        //     Serial.print("  offset=");
+        //     Serial.println(best_offset);
 
-            if (fine > THRESHOLD) {
-                blocks_since_detect = 0;
-                ledBlink();
-                Serial.println("  >>> CHIRP DETECTED");
-            }
-        }
+        //     if (fine > THRESHOLD) {
+        //         blocks_since_detect = 0;
+        //         ledBlink();
+        //         Serial.println("  >>> CHIRP DETECTED");
+        //     }
+        // }
     }
 }
