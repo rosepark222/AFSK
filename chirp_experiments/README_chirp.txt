@@ -1,4 +1,12 @@
 8/21
+the code actually used had delay(5000) so it is not the issue. In fact, a month ago, I set the chirp duration of 0.1 second, and exactly same issue. 
+
+Let me try different chirp begin and end frequencies. That will reveal a better view .
+
+Yes, great idea — if you change F_START and F_END and the cutoff always happens at the same time position (3/4 through) regardless of frequency, then it's a timing/buffer issue not a frequency/speaker issue. But if the cutoff always happens at the same frequency regardless of chirp duration, then it's the speaker or mic frequency response. Try something like F_START=200, F_END=800 and see where the cutoff occurs.
+
+
+8/21
   two pending issues ; 128 corr resolution Alignment issue — correlation is sampled every 128 samples so you likely never hit the exact peak, giving 0.017 instead of ~1.0 even at close range.  
   Signal integrity issue — at distance, reverberation, multipath reflections, and background noise corrupt the chirp waveform so even a perfectly aligned correlation won't reach 1.0 because the received chirp no longer matches the clean reference exactly.
   

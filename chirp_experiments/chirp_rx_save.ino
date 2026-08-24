@@ -4,18 +4,21 @@
 // ================= AUDIO SETUP ====================
 AudioInputI2S     i2s_in;
 AudioRecordQueue  queue1;
-AudioConnection   patchCord1(i2s_in, 0, queue1, 0);
+//AudioConnection   patchCord1(i2s_in, 0, queue1, 0);
+AudioFilterBiquad  dcBlocker;
+AudioConnection    patchCord1(i2s_in, 0, dcBlocker, 0);
+AudioConnection    patchCord2(dcBlocker, 0, queue1,  0);  // replace direct connection
 
 // ================= PARAMETERS =====================
 #define SAMPLE_RATE     44100
-#define CHIRP_DURATION  0.1f
+#define CHIRP_DURATION  1.0f
 #define CHIRP_SAMPLES   (int)(SAMPLE_RATE * CHIRP_DURATION)  // 4410
 
 #define F_START   300.0f
 #define F_END    1500.0f
 #define NUM_SLOTS   16
 
-#define CAPTURE_SECONDS  2
+#define CAPTURE_SECONDS  3
 #define CAPTURE_SAMPLES  (SAMPLE_RATE * CAPTURE_SECONDS)     // 88200
 
 // ================= BUFFERS ========================
@@ -80,6 +83,7 @@ void setup()
 
     // --- Audio init ---
     AudioMemory(160);
+    dcBlocker.setHighpass(0, 20, 0.707);  // 20Hz highpass removes DC
     queue1.begin();
 
     Serial.println("Capturing 2 seconds of audio...");
