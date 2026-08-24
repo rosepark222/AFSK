@@ -9,7 +9,7 @@ AudioConnection    patchCord2(queue, 0, i2s1, 1);
 
 // ─── Parameters ────────────────────────────────────────────
 #define SAMPLE_RATE     44100
-#define CHIRP_DURATION  0.1f
+#define CHIRP_DURATION  1.0f
 #define N_SAMPLES       (int)(SAMPLE_RATE * CHIRP_DURATION)
 
 #define F_START 300.0f
@@ -18,12 +18,12 @@ AudioConnection    patchCord2(queue, 0, i2s1, 1);
 #define ID 5
 #define NUM_SLOTS 16
 
-#define AMPLITUDE 0.25f   // 🔥 CRITICAL (try 0.2 ~ 0.4)
+#define AMPLITUDE 0.8f // 0.25f
 
 // ─── Buffer ────────────────────────────────────────────────
 int16_t chirp_buffer[N_SAMPLES];
 
-// ─── Generate CLEAN Cyclic Chirp ───────────────────────────
+// ─── Generate CLEAN Cyclic Chirp ──────────────────────────
 void generateChirp()
 {
     float bandwidth = F_END - F_START;
@@ -40,29 +40,29 @@ void generateChirp()
 
         float freq = f0 + k * t;
 
-        // wrap frequency
+        // Wrap frequency
         if (freq > F_END)
             freq -= bandwidth;
 
-        // 🔥 phase accumulator (correct instantaneous frequency)
+        // Phase accumulator
         phase += 2.0f * PI * freq / SAMPLE_RATE;
 
-        // optional: keep phase bounded
+        // Keep phase bounded
         if (phase > 2 * PI)
             phase -= 2 * PI;
 
         float s = sinf(phase);
 
-        // 🔥 Hann window (removes spectral splatter at edges)
+        // Hann window
         float w = 0.5f * (1.0f - cosf(2 * PI * n / (N_SAMPLES - 1)));
 
         float out = AMPLITUDE * s * w;
- 
+
         chirp_buffer[n] = (int16_t)(out * 32767.0f);
     }
 }
 
-// ─── Play Function ─────────────────────────────────────────
+// ─── Play Function ────────────────────────────────────────
 void playBuffer(int16_t *buf, int len)
 {
     int idx = 0;
@@ -71,7 +71,7 @@ void playBuffer(int16_t *buf, int len)
 
         if (queue.available() > 0) {
 
-            int16_t *block = (int16_t*)queue.getBuffer();
+            int16_t block = (int16_t)queue.getBuffer();
 
             for (int i = 0; i < AUDIO_BLOCK_SAMPLES; i++) {
 
@@ -97,11 +97,9 @@ void setup()
 // ─── Loop ──────────────────────────────────────────────────
 void loop()
 {
-    // Pilot chirp
+    // Play 100 ms chirp
     playBuffer(chirp_buffer, N_SAMPLES);
 
-    // ID chirp
-    //playBuffer(chirp_buffer, N_SAMPLES);
-
-    //delay(100); // gap
+    // Wait 1 second before playing the next chirp
+    delay(1000);
 }

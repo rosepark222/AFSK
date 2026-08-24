@@ -1,3 +1,9 @@
+8/21
+  two pending issues ; 128 corr resolution Alignment issue — correlation is sampled every 128 samples so you likely never hit the exact peak, giving 0.017 instead of ~1.0 even at close range.  
+  Signal integrity issue — at distance, reverberation, multipath reflections, and background noise corrupt the chirp waveform so even a perfectly aligned correlation won't reach 1.0 because the received chirp no longer matches the clean reference exactly.
+  
+
+
 Good—this output is actually very informative. It tells us exactly where the problem is:
 Window energy: 2.90        ✅ signal exists
 Corr max: 0.00             ❌ correlation completely broken
