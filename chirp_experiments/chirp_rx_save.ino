@@ -2,30 +2,31 @@
 #include <SD.h>
 
 // ================= AUDIO SETUP ====================
-AudioInputI2S     i2s_in;
-AudioRecordQueue  queue1;
-//AudioConnection   patchCord1(i2s_in, 0, queue1, 0);
+AudioInputI2S      i2s_in;
+AudioRecordQueue   queue1;
 AudioFilterBiquad  dcBlocker;
 AudioConnection    patchCord1(i2s_in, 0, dcBlocker, 0);
-AudioConnection    patchCord2(dcBlocker, 0, queue1,  0);  // replace direct connection
+AudioConnection    patchCord2(dcBlocker, 0, queue1,  0);
 
 // ================= PARAMETERS =====================
 #define SAMPLE_RATE     44100
 #define CHIRP_DURATION  1.0f
 #define CHIRP_SAMPLES   (int)(SAMPLE_RATE * CHIRP_DURATION)  // 4410
-
 #define F_START   300.0f
 #define F_END    1500.0f
 #define NUM_SLOTS   16
-
 #define CAPTURE_SECONDS  3
-#define CAPTURE_SAMPLES  (SAMPLE_RATE * CAPTURE_SECONDS)     // 88200
+#define CAPTURE_SAMPLES  (SAMPLE_RATE * CAPTURE_SECONDS)     // 132300
 
 // ================= BUFFERS ========================
 float ref_chirp[CHIRP_SAMPLES];
-
 int   capture_idx  = 0;
 bool  capture_done = false;
+
+// rx file handle — opened ONCE in setup, closed ONCE when capture finishes.
+// This is the key fix: no more per-loop SD.open()/close(), which was
+// blocking the main loop long enough for the audio queue to overflow.
+File rxFile;
 
 // ================= REFERENCE GENERATION ===========
 void generateReference(int ref_id = 0)
@@ -35,14 +36,11 @@ void generateReference(int ref_id = 0)
     float f0         = F_START + ref_id * slot_width;
     float k          = bandwidth / CHIRP_DURATION;
     float phase      = 0.0f;
-
     for (int n = 0; n < CHIRP_SAMPLES; n++) {
         float freq = f0 + k * ((float)n / SAMPLE_RATE);
         if (freq > F_END) freq -= bandwidth;
-
         phase += 2.0f * PI * freq / SAMPLE_RATE;
         if (phase > 2.0f * PI) phase -= 2.0f * PI;
-
         float s = sinf(phase);
         float w = 0.5f * (1.0f - cosf(2.0f * PI * n / (CHIRP_SAMPLES - 1)));
         ref_chirp[n] = s * w;
@@ -65,7 +63,6 @@ void setup()
 
     // --- Write reference chirp first (no audio needed) ---
     generateReference(0);
-
     if (SD.exists("ref_chirp.txt")) SD.remove("ref_chirp.txt");
     File refFile = SD.open("ref_chirp.txt", FILE_WRITE);
     if (!refFile) {
@@ -78,15 +75,20 @@ void setup()
     refFile.close();
     Serial.println("ref_chirp.txt written.");
 
-    // --- Prepare rx file ---
+    // --- Prepare rx file: open ONCE here, keep it open for the whole capture ---
     if (SD.exists("rx_chirp.txt")) SD.remove("rx_chirp.txt");
+    rxFile = SD.open("rx_chirp.txt", FILE_WRITE);
+    if (!rxFile) {
+        Serial.println("ERROR: Cannot open rx_chirp.txt. Halting.");
+        while (1) {}
+    }
 
     // --- Audio init ---
     AudioMemory(160);
     dcBlocker.setHighpass(0, 20, 0.707);  // 20Hz highpass removes DC
     queue1.begin();
 
-    Serial.println("Capturing 2 seconds of audio...");
+    Serial.println("Capturing 3 seconds of audio...");
 }
 
 // ================= LOOP ===========================
@@ -94,28 +96,21 @@ void loop()
 {
     if (capture_done) return;
 
-    // Open file in append mode each loop to keep writes incremental
-    File rxFile = SD.open("rx_chirp.txt", FILE_WRITE);
-    if (!rxFile) {
-        Serial.println("ERROR: Cannot open rx_chirp.txt. Halting.");
-        while (1) {}
-    }
-
+    // Drain whatever audio blocks are available right now.
+    // No SD.open()/close() in here anymore — rxFile stays open
+    // across the entire capture, so each loop pass is just a
+    // fast in-memory queue drain + buffered println() calls.
     while (queue1.available() && capture_idx < CAPTURE_SAMPLES) {
         int16_t *data = queue1.readBuffer();
-
         for (int i = 0; i < AUDIO_BLOCK_SAMPLES && capture_idx < CAPTURE_SAMPLES; i++) {
             float v = data[i] / 32768.0f;
             rxFile.println(v, 6);
             capture_idx++;
         }
-
         queue1.freeBuffer();
     }
 
-    rxFile.close();
-
-    // Progress report every ~0.5 s
+    // Progress report every ~10%
     static int last_pct = -1;
     int pct = (capture_idx * 100) / CAPTURE_SAMPLES;
     if (pct / 10 != last_pct / 10) {
@@ -125,8 +120,9 @@ void loop()
         Serial.println("%");
     }
 
-    // Done?
+    // Done? Close the file exactly once, here.
     if (capture_idx >= CAPTURE_SAMPLES) {
+        rxFile.close();
         capture_done = true;
         Serial.println("DONE");
     }
