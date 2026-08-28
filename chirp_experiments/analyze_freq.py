@@ -45,13 +45,34 @@ for i in range(n_windows):
     print(f"t={peak_time:.2f}s  peak_freq={peak_freq:.1f} Hz")
 
 # ─── Plot ──────────────────────────────────────────────────
-plt.figure(figsize=(12, 4))
-plt.plot(times, peak_freqs, marker='o', linewidth=1.5)
-plt.xlabel("Time (s)")
-plt.ylabel("Peak Frequency (Hz)")
-plt.title(f"Peak Frequency per 0.1s Window — {filename}")
-plt.grid(True)
+# Trim samples to an integer number of windows so the time axis aligns with frequency windows
+trim_length = n_windows * WINDOW_SIZE
+samples_trim = samples[:trim_length]
+t_samples = np.arange(len(samples_trim)) / SAMPLE_RATE
+
+fig, (ax_wave, ax_freq) = plt.subplots(2, 1, sharex=True, figsize=(12, 6),
+                                       gridspec_kw={"height_ratios": [1, 1]})
+
+# Time-domain waveform (top)
+ax_wave.plot(t_samples, samples_trim, color="C0", linewidth=0.7)
+ax_wave.set_ylabel("Amplitude")
+ax_wave.set_title(f"Time-domain Waveform — {filename}")
+ax_wave.grid(True)
+
+# Optionally mark window boundaries (uncomment if you want visual window markers)
+# for i in range(n_windows + 1):
+#     ax_wave.axvline(i * WINDOW_SEC, color="gray", linestyle=":", linewidth=0.5)
+#     ax_freq.axvline(i * WINDOW_SEC, color="gray", linestyle=":", linewidth=0.5)
+
+# Frequency peaks per window (bottom)
+ax_freq.plot(times, peak_freqs, marker='o', linewidth=1.5, color="C1")
+ax_freq.set_xlabel("Time (s)")
+ax_freq.set_ylabel("Peak Frequency (Hz)")
+ax_freq.set_title(f"Peak Frequency per {WINDOW_SEC:.2f}s Window")
+ax_freq.grid(True)
+
 plt.tight_layout()
-plt.savefig("freq_analysis.png", dpi=150)
+outname = "freq_analysis.png"
+plt.savefig(outname, dpi=150)
 plt.show()
-print("Saved freq_analysis.png")
+print(f"Saved {outname}")
