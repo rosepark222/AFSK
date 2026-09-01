@@ -1,0 +1,616 @@
+#include <Arduino.h>
+#include <Audio.h>
+#include <SD.h>
+#include <arm_math.h>
+#include <arm_const_structs.h>
+
+// ============================================================
+// Parameters
+// ============================================================
+
+static constexpr float FS = 44100.0f;
+
+static constexpr float CHIRP_DUR_S = 1.0f;
+static constexpr float SILENCE_DUR_S = 2.0f;
+static constexpr float SOS_PERIOD_S = CHIRP_DUR_S + SILENCE_DUR_S;
+
+static constexpr float F0 = 300.0f;
+static constexpr float F1 = 1500.0f;
+
+// 4096-point complex FFT
+static constexpr uint32_t FFT_N = 4096;
+
+// One-second chirp
+static constexpr uint32_t CHIRP_SAMPLES = (uint32_t)(FS * CHIRP_DUR_S);
+
+// Three-second SOS period
+static constexpr uint32_t SOS_PERIOD_SAMPLES = (uint32_t)(FS * SOS_PERIOD_S);
+
+// 44100 / 4096 = 10 full blocks + partial block
+static constexpr uint32_t BLOCKS_PER_CHIRP = (CHIRP_SAMPLES + FFT_N - 1) / FFT_N;
+
+// Detection threshold
+static constexpr float DETECT_RATIO_THRESHOLD = 8.0f;
+static constexpr float EPS = 1e-12f;
+
+// Streamed FFT-magnitude debug capture.
+// Each 4096-sample block is written immediately to the SD card to avoid large RAM usage.
+static constexpr bool ENABLE_DEBUG_CAPTURE = true;
+static constexpr uint32_t DEBUG_CAPTURE_BLOCKS = 32u;
+static constexpr uint32_t DEBUG_CAPTURE_SAMPLES = DEBUG_CAPTURE_BLOCKS * FFT_N;
+static constexpr uint32_t DEBUG_FLUSH_INTERVAL = 1u;
+
+
+// ============================================================
+// Audio Objects
+// ============================================================
+
+AudioInputI2S       i2s1;
+AudioRecordQueue    queue1;
+
+AudioConnection patchCord1(i2s1, 0, queue1, 0);
+
+AudioControlSGTL5000 sgtl5000;
+
+
+// ============================================================
+// Large buffers
+// ============================================================
+
+// Reference chirp
+DMAMEM static float chirpCos[CHIRP_SAMPLES];
+DMAMEM static float chirpSin[CHIRP_SAMPLES];
+
+// Hann window
+DMAMEM static float hann4096[FFT_N];
+
+// Complex FFT buffer:
+//
+// [real0, imag0,
+//  real1, imag1,
+//  ...
+//  real4095, imag4095]
+//
+DMAMEM static float fftIn[2 * FFT_N];
+
+// Magnitude spectrum
+DMAMEM static float fftMag[FFT_N];
+
+// Frequency-domain coherent accumulator
+DMAMEM static float sumSpecRe[FFT_N];
+DMAMEM static float sumSpecIm[FFT_N];
+
+File debugFftFile;
+uint32_t debugWriteCount = 0;
+
+
+// ============================================================
+// State
+// ============================================================
+
+volatile uint32_t totalSamples = 0;
+
+uint32_t chirpBlockCount = 0;
+
+bool inChirpPrev = false;
+
+volatile uint32_t debugFftCount = 0;
+bool debugCaptureStarted = false;
+bool debugCaptureDone = false;
+
+
+// ============================================================
+// Build reference chirp
+// ============================================================
+
+void buildReferenceChirp()
+{
+    const float k = (F1 - F0) / CHIRP_DUR_S;
+
+    Serial.println("Building reference chirp...");
+
+    for (uint32_t n = 0; n < CHIRP_SAMPLES; n++)
+    {
+        float t = (float)n / FS;
+        float phase = 2.0f * PI * (F0 * t + 0.5f * k * t * t);
+
+        chirpCos[n] = arm_cos_f32(phase);
+        chirpSin[n] = arm_sin_f32(phase);
+    }
+
+    Serial.println("Building Hann window...");
+
+    for (uint32_t n = 0; n < FFT_N; n++)
+    {
+        hann4096[n] = 0.5f - 0.5f * arm_cos_f32((2.0f * PI * n) / (FFT_N - 1));
+    }
+
+    Serial.println("Reference generation complete.");
+}
+
+
+// ============================================================
+// Reset frequency-domain accumulator
+// ============================================================
+
+void resetAccumulator()
+{
+    memset(sumSpecRe, 0, sizeof(sumSpecRe));
+    memset(sumSpecIm, 0, sizeof(sumSpecIm));
+
+    chirpBlockCount = 0;
+}
+
+bool initDebugSD()
+{
+    if (!SD.begin(BUILTIN_SDCARD))
+    {
+        Serial.println("SD init failed: no card or card not detected.");
+        return false;
+    }
+
+    if (SD.exists("fft_mag.txt"))
+    {
+        Serial.println("Removing existing fft_mag.txt before new capture.");
+        SD.remove("fft_mag.txt");
+    }
+
+    Serial.println("SD card initialized for debug capture.");
+    return true;
+}
+
+void writeDebugCaptureFiles()
+{
+    if (debugCaptureStarted || debugCaptureDone)
+    {
+        return;
+    }
+
+    if (!SD.begin(BUILTIN_SDCARD))
+    {
+        Serial.println("SD write skipped: card unavailable.");
+        return;
+    }
+
+    if (SD.exists("fft_mag.txt"))
+    {
+        Serial.println("Removing stale fft_mag.txt before open.");
+        SD.remove("fft_mag.txt");
+    }
+
+    debugFftFile = SD.open("fft_mag.txt", FILE_WRITE);
+    if (debugFftFile)
+    {
+        Serial.println("fft_mag.txt opened for streaming debug capture.");
+        debugCaptureStarted = true;
+    }
+    else
+    {
+        Serial.println("Failed to open fft_mag.txt");
+        return;
+    }
+
+    Serial.println("Debug capture streaming started.");
+}
+
+void streamDebugFftSpectrum(const float *mag)
+{
+    if (!debugFftFile)
+    {
+        return;
+    }
+
+    for (uint32_t k = 0; k < FFT_N; k++)
+    {
+        debugFftFile.print(mag[k], 8);
+        if (k + 1 < FFT_N)
+        {
+            debugFftFile.print(',');
+        }
+    }
+    debugFftFile.println();
+    debugWriteCount++;
+
+    Serial.print("dump_done block=");
+    Serial.print((totalSamples / FFT_N) - 1);
+    Serial.print(" t=");
+    Serial.print((float)totalSamples / FS, 3);
+    Serial.print(" s count=");
+    Serial.print(debugWriteCount);
+    Serial.println();
+
+    if (debugWriteCount >= DEBUG_CAPTURE_BLOCKS)
+    {
+        debugFftFile.close();
+        Serial.print("fft_mag.txt written with ");
+        Serial.print(debugWriteCount);
+        Serial.println(" spectra");
+        debugCaptureDone = true;
+    }
+}
+
+
+// ============================================================
+// Determine whether an absolute sample is inside the chirp
+// ============================================================
+
+inline bool isInChirp(uint32_t absSampleIdx)
+{
+    (void)absSampleIdx;
+    return true;
+}
+
+
+// ============================================================
+// Process one 4096-sample block
+// ============================================================
+
+void process4096Block(const float *x)
+{
+    // --------------------------------------------------------
+    // Dechirp:
+    //
+    // received signal × conjugate(reference chirp)
+    //
+    // conj(cos + j*sin)
+    //       =
+    // cos - j*sin
+    // --------------------------------------------------------
+
+    for (uint32_t n = 0; n < FFT_N; n++)
+    {
+        uint32_t absIdx = totalSamples + n;
+        uint32_t chirpPos = absIdx % CHIRP_SAMPLES;
+        float c = chirpCos[chirpPos];
+        float s = chirpSin[chirpPos];
+        float xn = x[n] * hann4096[n];
+
+        // We do not try to infer chirp boundaries from signal energy.
+        // Continuous dechirp/FFT over every incoming block is the correct debug mode.
+        float re = xn * c;
+        float im = -xn * s;
+
+        fftIn[2 * n + 0] = re;
+        fftIn[2 * n + 1] = im;
+    }
+
+    if (ENABLE_DEBUG_CAPTURE)
+    {
+        Serial.print("mix_done block=");
+        Serial.print(totalSamples / FFT_N);
+        Serial.print(" t=");
+        Serial.print((float)totalSamples / FS, 3);
+        Serial.print(" s");
+        Serial.println();
+    }
+
+    // --------------------------------------------------------
+    // 4096-point complex FFT
+    //
+    // Uses the pre-initialized CMSIS-DSP structure from
+    // arm_const_structs.h
+    // --------------------------------------------------------
+
+    arm_cfft_f32(&arm_cfft_sR_f32_len4096, fftIn, 0, 1);
+
+    for (uint32_t k = 0; k < FFT_N; k++)
+    {
+        float re = fftIn[2 * k + 0];
+        float im = fftIn[2 * k + 1];
+        fftMag[k] = sqrtf(re * re + im * im);
+    }
+
+    if (ENABLE_DEBUG_CAPTURE)
+    {
+        Serial.print("fft_done block=");
+        Serial.print(totalSamples / FFT_N);
+        Serial.print(" t=");
+        Serial.print((float)totalSamples / FS, 3);
+        Serial.print(" s");
+        Serial.println();
+    }
+
+    if (ENABLE_DEBUG_CAPTURE && debugCaptureStarted && !debugCaptureDone)
+    {
+        streamDebugFftSpectrum(fftMag);
+    }
+
+
+    // --------------------------------------------------------
+    // Determine whether this block belongs to chirp
+    // --------------------------------------------------------
+
+    bool blockInChirp = true;
+
+    // --------------------------------------------------------
+    // Accumulate complex spectrum
+    // --------------------------------------------------------
+
+    if (blockInChirp)
+    {
+        for (uint32_t k = 0; k < FFT_N; k++)
+        {
+            sumSpecRe[k] += fftIn[2 * k + 0];
+            sumSpecIm[k] += fftIn[2 * k + 1];
+        }
+
+        chirpBlockCount++;
+    }
+
+
+    // --------------------------------------------------------
+    // Chirp-boundary detection is intentionally disabled while debugging the
+    // continuous dechirp/FFT path. We do not infer chirp timing from energy.
+    // --------------------------------------------------------
+
+    bool nowInChirp = true;
+
+    if (inChirpPrev && !nowInChirp && chirpBlockCount > 0)
+    {
+        // ----------------------------------------------------
+        // Compute magnitude of accumulated spectrum
+        // ----------------------------------------------------
+
+        for (uint32_t k = 0; k < FFT_N; k++)
+        {
+            float re = sumSpecRe[k];
+            float im = sumSpecIm[k];
+            fftMag[k] = sqrtf(re * re + im * im);
+        }
+
+
+        // ----------------------------------------------------
+        // Find maximum
+        // ----------------------------------------------------
+
+        float maxVal = 0.0f;
+        uint32_t maxIdx = 0;
+
+        arm_max_f32(
+            fftMag,
+            FFT_N,
+            &maxVal,
+            &maxIdx
+        );
+
+
+        // ----------------------------------------------------
+        // Calculate mean spectrum magnitude
+        // ----------------------------------------------------
+
+        float meanVal = 0.0f;
+
+        arm_mean_f32(
+            fftMag,
+            FFT_N,
+            &meanVal
+        );
+
+
+        // ----------------------------------------------------
+        // Peak-to-average ratio
+        // ----------------------------------------------------
+
+        float ratio = maxVal / (meanVal + EPS);
+
+        // ----------------------------------------------------
+        // Convert FFT bin to frequency
+        //
+        // FFT resolution:
+        //
+        // 44100 / 4096 = 10.7666 Hz
+        // ----------------------------------------------------
+
+        float peakFreq = ((float)maxIdx * FS) / FFT_N;
+
+
+        // ----------------------------------------------------
+        // Print result
+        // ----------------------------------------------------
+
+        Serial.print("[CHIRP END] ");
+
+        Serial.print("blocks=");
+        Serial.print(chirpBlockCount);
+
+        Serial.print(" peakBin=");
+        Serial.print(maxIdx);
+
+        Serial.print(" peakFreq=");
+        Serial.print(peakFreq, 3);
+        Serial.print(" Hz");
+
+        Serial.print(" peak=");
+        Serial.print(maxVal, 6);
+
+        Serial.print(" mean=");
+        Serial.print(meanVal, 6);
+
+        Serial.print(" ratio=");
+        Serial.print(ratio, 3);
+
+
+        if (ratio > DETECT_RATIO_THRESHOLD)
+        {
+            Serial.print("  --> DETECT");
+        }
+
+        Serial.println();
+
+
+        // ----------------------------------------------------
+        // Ready for next SOS period
+        // ----------------------------------------------------
+
+        resetAccumulator();
+    }
+
+
+    // Update state
+
+    inChirpPrev = nowInChirp;
+
+    totalSamples += FFT_N;
+}
+
+
+// ============================================================
+// Setup
+// ============================================================
+
+void setup()
+{
+    Serial.begin(115200);
+
+    while (!Serial &&
+           millis() < 3000)
+    {
+    }
+
+
+    Serial.println();
+    Serial.println("==============================");
+    Serial.println("Teensy 4.1 Dechirp FFT");
+    Serial.println("==============================");
+
+
+    // --------------------------------------------------------
+    // Audio memory
+    // --------------------------------------------------------
+
+    AudioMemory(120);
+
+
+    // --------------------------------------------------------
+    // SGTL5000
+    // --------------------------------------------------------
+
+    sgtl5000.enable();
+
+    sgtl5000.inputSelect(
+        AUDIO_INPUT_LINEIN
+    );
+
+    sgtl5000.lineInLevel(5);
+
+    sgtl5000.volume(0.5);
+
+
+    // --------------------------------------------------------
+    // Start AudioRecordQueue
+    // --------------------------------------------------------
+
+    queue1.begin();
+
+    if (ENABLE_DEBUG_CAPTURE)
+    {
+        initDebugSD();
+    }
+
+
+    // --------------------------------------------------------
+    // Build reference
+    // --------------------------------------------------------
+
+    buildReferenceChirp();
+
+
+    // --------------------------------------------------------
+    // Clear accumulator
+    // --------------------------------------------------------
+
+    resetAccumulator();
+
+
+    // --------------------------------------------------------
+    // Print FFT configuration
+    // --------------------------------------------------------
+
+    Serial.println();
+    Serial.println("Configuration:");
+
+    Serial.print("Sample rate: ");
+    Serial.print(FS);
+    Serial.println(" Hz");
+
+    Serial.print("Chirp: ");
+    Serial.print(F0);
+    Serial.print(" -> ");
+    Serial.print(F1);
+    Serial.println(" Hz");
+
+    Serial.print("Chirp duration: ");
+    Serial.print(CHIRP_DUR_S);
+    Serial.println(" sec");
+
+    Serial.print("FFT size: ");
+    Serial.println(FFT_N);
+
+    Serial.print("FFT resolution: ");
+    Serial.print(FS / FFT_N, 4);
+    Serial.println(" Hz/bin");
+
+    Serial.print("FFT time window: ");
+    Serial.print((float)FFT_N / FS * 1000.0f, 3);
+    Serial.println(" ms");
+
+    Serial.print("Chirp samples: ");
+    Serial.println(CHIRP_SAMPLES);
+
+    Serial.print("FFT blocks/chirp: ");
+    Serial.println(BLOCKS_PER_CHIRP);
+
+    Serial.println();
+    Serial.println("CMSIS-DSP CFFT = 4096");
+    Serial.println("Using arm_cfft_sR_f32_len4096");
+    Serial.println("Detector ready.");
+}
+
+
+// ============================================================
+// Main loop
+// ============================================================
+
+void loop()
+{
+    // 4096 sample accumulation buffer
+    static float block4096[FFT_N];
+
+    static uint32_t fill = 0;
+
+
+    // --------------------------------------------------------
+    // Process available 128-sample Audio blocks
+    //
+    // AUDIO_BLOCK_SAMPLES is already defined by Teensy Audio
+    // library, so we do NOT redefine it.
+    // --------------------------------------------------------
+
+    while (queue1.available() > 0)
+    {
+        int16_t *p = queue1.readBuffer();
+
+        if (!p)
+            break;
+
+        for (uint32_t i = 0; i < AUDIO_BLOCK_SAMPLES; i++)
+        {
+            float sample = (float)p[i] * (1.0f / 32768.0f);
+            block4096[fill++] = sample;
+
+            if (fill >= FFT_N)
+            {
+                process4096Block(block4096);
+                fill = 0;
+            }
+        }
+
+        if (ENABLE_DEBUG_CAPTURE && !debugCaptureStarted && !debugCaptureDone && totalSamples >= 0)
+        {
+            writeDebugCaptureFiles();
+        }
+
+        queue1.freeBuffer();
+    }
+}
+
