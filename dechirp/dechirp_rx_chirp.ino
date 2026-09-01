@@ -1,3 +1,27 @@
+/*
+Overall flow:
+1. Search the incoming audio for a rough chirp start using a sliding cross-correlation
+   against the known reference chirp.
+2. When the correlation exceeds threshold, lock in a rough chirp start sample index.
+3. Use that start anchor to dechirp every later FFT block with the correct phase and timing.
+4. When the chirp burst ends and the 2s silence starts, re-arm the search for the next burst.
+5. Continue FFT debug capture while in debug mode.
+
+
+6. the compact expected pattern for your 1 s chirp / 2 s silence schedule.
+
+[STATE=SEARCHING] iter=N sample=<during silence> corr=... bestOffset=...
+...
+[STATE=TRANSITION] SEARCHING -> DECHIRPING sample=S0 searchIters=N corr=...
+[STATE=DECHIRPING] blocks=1 peakBin=... peakFreq=... Hz peak=... mean=... ratio=...
+[STATE=DECHIRPING] blocks=2 peakBin=... peakFreq=... Hz peak=... mean=... ratio=...
+...
+[STATE=DECHIRPING] blocks=10 peakBin=... peakFreq=... Hz peak=... mean=... ratio=...
+[STATE=SILENCE] re-arming search after silence period at sample=S0 + 44100 + 88200
+[STATE=SEARCHING] iter=1 sample=S0 + 132300 corr=... bestOffset=...
+
+*/
+
 #include <Arduino.h>
 #include <Audio.h>
 #include <SD.h>
@@ -31,6 +55,7 @@ static constexpr uint32_t BLOCKS_PER_CHIRP = (CHIRP_SAMPLES + FFT_N - 1) / FFT_N
 
 // Detection threshold
 static constexpr float DETECT_RATIO_THRESHOLD = 8.0f;
+static constexpr float ROUGH_SEARCH_THRESHOLD = 0.08f;
 static constexpr float EPS = 1e-12f;
 
 // Streamed FFT-magnitude debug capture.
@@ -60,6 +85,13 @@ AudioControlSGTL5000 sgtl5000;
 // Reference chirp
 DMAMEM static float chirpCos[CHIRP_SAMPLES];
 DMAMEM static float chirpSin[CHIRP_SAMPLES];
+static float refEnergy = 0.0f;
+
+// Search buffer for rough chirp-start detection
+DMAMEM static float searchBuf[CHIRP_SAMPLES];
+static uint32_t searchHead = 0;
+static bool chirpStartFound = false;
+static uint32_t chirpStartSample = 0;
 
 // Hann window
 DMAMEM static float hann4096[FFT_N];
@@ -88,9 +120,18 @@ uint32_t debugWriteCount = 0;
 // State
 // ============================================================
 
+enum MachineState {
+    STATE_SEARCHING = 0,
+    STATE_DECHIRPING = 1,
+    STATE_SILENCE = 2
+};
+
 volatile uint32_t totalSamples = 0;
 
 uint32_t chirpBlockCount = 0;
+uint32_t searchIterations = 0;
+uint32_t dechirpBlocksSeen = 0;
+MachineState machineState = STATE_SEARCHING;
 
 bool inChirpPrev = false;
 
@@ -106,6 +147,7 @@ bool debugCaptureDone = false;
 void buildReferenceChirp()
 {
     const float k = (F1 - F0) / CHIRP_DUR_S;
+    refEnergy = 0.0f;
 
     Serial.println("Building reference chirp...");
 
@@ -116,6 +158,7 @@ void buildReferenceChirp()
 
         chirpCos[n] = arm_cos_f32(phase);
         chirpSin[n] = arm_sin_f32(phase);
+        refEnergy += chirpCos[n] * chirpCos[n];
     }
 
     Serial.println("Building Hann window...");
@@ -157,6 +200,39 @@ bool initDebugSD()
 
     Serial.println("SD card initialized for debug capture.");
     return true;
+}
+
+float roughSearchForChirpStart(uint32_t &bestOffset)
+{
+    float bestCorr = 0.0f;
+    bestOffset = 0;
+
+    for (uint32_t offset = 0; offset < AUDIO_BLOCK_SAMPLES; offset++)
+    {
+        float acc = 0.0f;
+        float rxEnergy = 0.0f;
+
+        for (uint32_t n = 0; n < CHIRP_SAMPLES; n++)
+        {
+            uint32_t idx = (searchHead - offset - n + CHIRP_SAMPLES) % CHIRP_SAMPLES;
+            float rx = searchBuf[idx];
+            float ref = chirpCos[(CHIRP_SAMPLES - 1 - n)];
+
+            acc += rx * ref;
+            rxEnergy += rx * rx;
+        }
+
+        float denom = sqrtf(rxEnergy * refEnergy) + EPS;
+        float corr = fabsf(acc) / denom;
+
+        if (corr > bestCorr)
+        {
+            bestCorr = corr;
+            bestOffset = offset;
+        }
+    }
+
+    return bestCorr;
 }
 
 void writeDebugCaptureFiles()
@@ -236,8 +312,13 @@ void streamDebugFftSpectrum(const float *mag)
 
 inline bool isInChirp(uint32_t absSampleIdx)
 {
-    (void)absSampleIdx;
-    return true;
+    if (!chirpStartFound)
+    {
+        return false;
+    }
+
+    uint32_t rel = absSampleIdx - chirpStartSample;
+    return (rel < CHIRP_SAMPLES);
 }
 
 
@@ -260,7 +341,9 @@ void process4096Block(const float *x)
     for (uint32_t n = 0; n < FFT_N; n++)
     {
         uint32_t absIdx = totalSamples + n;
-        uint32_t chirpPos = absIdx % CHIRP_SAMPLES;
+        uint32_t chirpPos = chirpStartFound
+            ? ((absIdx - chirpStartSample + CHIRP_SAMPLES) % CHIRP_SAMPLES)
+            : (absIdx % CHIRP_SAMPLES);
         float c = chirpCos[chirpPos];
         float s = chirpSin[chirpPos];
         float xn = x[n] * hann4096[n];
@@ -320,10 +403,16 @@ void process4096Block(const float *x)
     // Determine whether this block belongs to chirp
     // --------------------------------------------------------
 
-    bool blockInChirp = true;
+    bool blockInChirp = isInChirp(totalSamples + FFT_N / 2);
+
+    // Reset the coherent accumulator at the start of each chirp window.
+    if (!inChirpPrev && blockInChirp)
+    {
+        resetAccumulator();
+    }
 
     // --------------------------------------------------------
-    // Accumulate complex spectrum
+    // Accumulate complex spectrum across chirp blocks.
     // --------------------------------------------------------
 
     if (blockInChirp)
@@ -339,11 +428,10 @@ void process4096Block(const float *x)
 
 
     // --------------------------------------------------------
-    // Chirp-boundary detection is intentionally disabled while debugging the
-    // continuous dechirp/FFT path. We do not infer chirp timing from energy.
+    // Determine whether chirp has just ended.
     // --------------------------------------------------------
 
-    bool nowInChirp = true;
+    bool nowInChirp = isInChirp(totalSamples + FFT_N - 1);
 
     if (inChirpPrev && !nowInChirp && chirpBlockCount > 0)
     {
@@ -408,8 +496,7 @@ void process4096Block(const float *x)
         // Print result
         // ----------------------------------------------------
 
-        Serial.print("[CHIRP END] ");
-
+        Serial.print("[STATE=DECHIRPING] ");
         Serial.print("blocks=");
         Serial.print(chirpBlockCount);
 
@@ -428,7 +515,6 @@ void process4096Block(const float *x)
 
         Serial.print(" ratio=");
         Serial.print(ratio, 3);
-
 
         if (ratio > DETECT_RATIO_THRESHOLD)
         {
@@ -564,6 +650,7 @@ void setup()
     Serial.println("CMSIS-DSP CFFT = 4096");
     Serial.println("Using arm_cfft_sR_f32_len4096");
     Serial.println("Detector ready.");
+    Serial.println("[STATE=SEARCHING] machine started in search mode");
 }
 
 
@@ -596,7 +683,13 @@ void loop()
         for (uint32_t i = 0; i < AUDIO_BLOCK_SAMPLES; i++)
         {
             float sample = (float)p[i] * (1.0f / 32768.0f);
+
+            // Feed the FFT accumulation buffer.
             block4096[fill++] = sample;
+
+            // Feed the rough-search rolling buffer used for chirp start detection.
+            searchBuf[searchHead] = sample;
+            searchHead = (searchHead + 1) % CHIRP_SAMPLES;
 
             if (fill >= FFT_N)
             {
@@ -610,7 +703,64 @@ void loop()
             writeDebugCaptureFiles();
         }
 
+        // Rough chirp-start search: when no start has been locked yet, keep a rolling buffer
+        // and perform a cross-correlation against the known chirp reference. Once the peak
+        // exceeds threshold, the chirp start is established and all subsequent dechirp blocks
+        // use that alignment.
+        if (!chirpStartFound && totalSamples >= CHIRP_SAMPLES)
+        {
+            machineState = STATE_SEARCHING;
+            uint32_t bestOffset = 0;
+            float roughCorr = roughSearchForChirpStart(bestOffset);
+            searchIterations++;
+
+            if ((searchIterations % 20u) == 0u || roughCorr > ROUGH_SEARCH_THRESHOLD)
+            {
+                Serial.print("[STATE=SEARCHING] iter=");
+                Serial.print(searchIterations);
+                Serial.print(" sample=");
+                Serial.print(totalSamples);
+                Serial.print(" corr=");
+                Serial.print(roughCorr, 4);
+                Serial.print(" bestOffset=");
+                Serial.print(bestOffset);
+                Serial.println();
+            }
+
+            if (roughCorr > ROUGH_SEARCH_THRESHOLD)
+            {
+                chirpStartSample = totalSamples - CHIRP_SAMPLES + bestOffset;
+                chirpStartFound = true;
+                machineState = STATE_DECHIRPING;
+
+                Serial.print("[STATE=TRANSITION] SEARCHING -> DECHIRPING sample=");
+                Serial.print(chirpStartSample);
+                Serial.print(" searchIters=");
+                Serial.print(searchIterations);
+                Serial.print(" corr=");
+                Serial.print(roughCorr, 4);
+                Serial.println();
+            }
+        }
+
+        // When the chirp ends, re-arm the search for the next burst.
+        if (chirpStartFound && !debugCaptureDone && totalSamples > chirpStartSample + CHIRP_SAMPLES + (uint32_t)(SILENCE_DUR_S * FS))
+        {
+            chirpStartFound = false;
+            machineState = STATE_SILENCE;
+            memset(searchBuf, 0, sizeof(searchBuf));
+            searchHead = 0;
+            Serial.print("[STATE=SILENCE] re-arming search after silence period at sample=");
+            Serial.print(totalSamples);
+            Serial.println();
+            searchIterations = 0;
+        }
+
+        if (chirpStartFound && machineState == STATE_DECHIRPING)
+        {
+            dechirpBlocksSeen++;
+        }
+
         queue1.freeBuffer();
     }
 }
-
