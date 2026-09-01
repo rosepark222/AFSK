@@ -44,16 +44,11 @@ $$
 
 Write the real signal as the real part of a complex exponential:
 
-$$
- x(t) = \Re\left\{A e^{j\left(2\pi\left(f_0 t + \frac{k}{2}t^2\right) + \phi_x\right)}\right\}
-$$
+$$ x(t) = \Re \lbrace A e^{j(2\pi(f_0 t + \frac{k}{2}t^2) + \phi_x)} \rbrace $$
 
 Then the product becomes
 
-$$
- y(t) = \Re\left\{A e^{j\left(2\pi\left(f_0 t + \frac{k}{2}t^2\right) + \phi_x\right)}\right\}
-       e^{-j\left(2\pi\left(f_0 t + \frac{k}{2}t^2\right) + \phi_r\right)}
-$$
+$$ y(t) = \Re\lbrace A e^{j(2\pi(f_0 t + \frac{k}{2}t^2) + \phi_x)} \rbrace e^{-j(2\pi(f_0 t + \frac{k}{2}t^2) + \phi_r)} $$
 
 Using the identity
 
