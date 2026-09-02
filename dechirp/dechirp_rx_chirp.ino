@@ -533,10 +533,7 @@ void process4096Block(const float *x)
 
 
     // Update state
-
     inChirpPrev = nowInChirp;
-
-    totalSamples += FFT_N;
 }
 
 
@@ -693,7 +690,17 @@ void loop()
 
             if (fill >= FFT_N)
             {
-                process4096Block(block4096);
+                // Phase gate:
+                // - SEARCH/SILENCE (Phase 1): keep ingesting/searching only.
+                // - DECHIRPING (Phase 2): run dechirp + FFT pipeline.
+                const bool isDechirpPhase = (machineState == STATE_DECHIRPING);
+                if (isDechirpPhase)
+                {
+                    process4096Block(block4096);
+                }
+
+                // Keep absolute sample indexing advancing in every phase.
+                totalSamples += FFT_N;
                 fill = 0;
             }
         }
