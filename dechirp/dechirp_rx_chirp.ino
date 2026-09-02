@@ -82,35 +82,30 @@ AudioControlSGTL5000 sgtl5000;
 // Large buffers
 // ============================================================
 
-// Reference chirp
-DMAMEM static float chirpCos[CHIRP_SAMPLES];
-DMAMEM static float chirpSin[CHIRP_SAMPLES];
+// Large reference/search arrays live in normal RAM.
+// Keeping them in DMAMEM pushes the Teensy 4.1 DMA region over its limit once
+// AudioMemory() and the audio queue are also allocated.
+static float chirpCos[CHIRP_SAMPLES];
+static float chirpSin[CHIRP_SAMPLES];
 static float refEnergy = 0.0f;
 
-// Search buffer for rough chirp-start detection
-DMAMEM static float searchBuf[CHIRP_SAMPLES];
+// Search buffer for rough chirp-start detection.
+// Once a chirp start is found, this buffer is explicitly handed over to the
+// dechirp/FFT scratch path and reused as a raw memory pool.
+static float searchBuf[CHIRP_SAMPLES];
 static uint32_t searchHead = 0;
 static bool chirpStartFound = false;
 static uint32_t chirpStartSample = 0;
 
+enum BufferMode {
+    BUFFER_SEARCH = 0,
+    BUFFER_DECHIRP = 1
+};
+
+static BufferMode searchBufferMode = BUFFER_SEARCH;
+
 // Hann window
-DMAMEM static float hann4096[FFT_N];
-
-// Complex FFT buffer:
-//
-// [real0, imag0,
-//  real1, imag1,
-//  ...
-//  real4095, imag4095]
-//
-DMAMEM static float fftIn[2 * FFT_N];
-
-// Magnitude spectrum
-DMAMEM static float fftMag[FFT_N];
-
-// Frequency-domain coherent accumulator
-DMAMEM static float sumSpecRe[FFT_N];
-DMAMEM static float sumSpecIm[FFT_N];
+static float hann4096[FFT_N];
 
 File debugFftFile;
 uint32_t debugWriteCount = 0;
@@ -176,12 +171,30 @@ void buildReferenceChirp()
 // Reset frequency-domain accumulator
 // ============================================================
 
-void resetAccumulator()
+void resetAccumulator(float *sumSpecRe, float *sumSpecIm)
 {
-    memset(sumSpecRe, 0, sizeof(sumSpecRe));
-    memset(sumSpecIm, 0, sizeof(sumSpecIm));
+    memset(sumSpecRe, 0, FFT_N * sizeof(float));
+    memset(sumSpecIm, 0, FFT_N * sizeof(float));
 
     chirpBlockCount = 0;
+}
+
+void resetAccumulator()
+{
+    const uint32_t SUM_RE_OFFSET = 3u * FFT_N;
+    const uint32_t SUM_IM_OFFSET = 4u * FFT_N;
+
+    float *sumSpecRe = searchBuf + SUM_RE_OFFSET;
+    float *sumSpecIm = searchBuf + SUM_IM_OFFSET;
+
+    resetAccumulator(sumSpecRe, sumSpecIm);
+}
+
+void setSearchBufferMode(BufferMode mode)
+{
+    searchBufferMode = mode;
+    memset(searchBuf, 0, sizeof(searchBuf));
+    searchHead = 0;
 }
 
 bool initDebugSD()
@@ -326,30 +339,44 @@ inline bool isInChirp(uint32_t absSampleIdx)
 // Process one 4096-sample block
 // ============================================================
 
-void process4096Block(const float *x)
+inline uint32_t getSearchBufIndex(uint32_t absSampleIdx)
+{
+    return (absSampleIdx + CHIRP_SAMPLES - totalSamples + searchHead + CHIRP_SAMPLES) % CHIRP_SAMPLES;
+}
+
+void process4096Block(uint32_t blockStartSample)
 {
     // --------------------------------------------------------
-    // Dechirp:
+    // Search phase uses searchBuf as a raw circular ring.
+    // Dechirp phase reuses the same memory as a fixed scratch layout:
     //
-    // received signal × conjugate(reference chirp)
-    //
-    // conj(cos + j*sin)
-    //       =
-    // cos - j*sin
+    //   [0 .. 2*FFT_N-1]     = fftIn (complex interleaved)
+    //   [2*FFT_N .. 3*FFT_N-1] = fftMag
+    //   [3*FFT_N .. 4*FFT_N-1] = sumSpecRe
+    //   [4*FFT_N .. 5*FFT_N-1] = sumSpecIm
     // --------------------------------------------------------
+
+    const uint32_t FFT_IN_OFFSET = 0u;
+    const uint32_t FFT_MAG_OFFSET = 2u * FFT_N;
+    const uint32_t SUM_RE_OFFSET = 3u * FFT_N;
+    const uint32_t SUM_IM_OFFSET = 4u * FFT_N;
+
+    float *fftIn = searchBuf + FFT_IN_OFFSET;
+    float *fftMag = searchBuf + FFT_MAG_OFFSET;
+    float *sumSpecRe = searchBuf + SUM_RE_OFFSET;
+    float *sumSpecIm = searchBuf + SUM_IM_OFFSET;
 
     for (uint32_t n = 0; n < FFT_N; n++)
     {
-        uint32_t absIdx = totalSamples + n;
+        uint32_t absIdx = blockStartSample + n;
+        uint32_t bufIdx = getSearchBufIndex(absIdx);
         uint32_t chirpPos = chirpStartFound
             ? ((absIdx - chirpStartSample + CHIRP_SAMPLES) % CHIRP_SAMPLES)
             : (absIdx % CHIRP_SAMPLES);
         float c = chirpCos[chirpPos];
         float s = chirpSin[chirpPos];
-        float xn = x[n] * hann4096[n];
+        float xn = searchBuf[bufIdx] * hann4096[n];
 
-        // We do not try to infer chirp boundaries from signal energy.
-        // Continuous dechirp/FFT over every incoming block is the correct debug mode.
         float re = xn * c;
         float im = -xn * s;
 
@@ -360,19 +387,12 @@ void process4096Block(const float *x)
     if (ENABLE_DEBUG_CAPTURE)
     {
         Serial.print("mix_done block=");
-        Serial.print(totalSamples / FFT_N);
+        Serial.print(blockStartSample / FFT_N);
         Serial.print(" t=");
-        Serial.print((float)totalSamples / FS, 3);
+        Serial.print((float)blockStartSample / FS, 3);
         Serial.print(" s");
         Serial.println();
     }
-
-    // --------------------------------------------------------
-    // 4096-point complex FFT
-    //
-    // Uses the pre-initialized CMSIS-DSP structure from
-    // arm_const_structs.h
-    // --------------------------------------------------------
 
     arm_cfft_f32(&arm_cfft_sR_f32_len4096, fftIn, 0, 1);
 
@@ -386,9 +406,9 @@ void process4096Block(const float *x)
     if (ENABLE_DEBUG_CAPTURE)
     {
         Serial.print("fft_done block=");
-        Serial.print(totalSamples / FFT_N);
+        Serial.print(blockStartSample / FFT_N);
         Serial.print(" t=");
-        Serial.print((float)totalSamples / FS, 3);
+        Serial.print((float)blockStartSample / FS, 3);
         Serial.print(" s");
         Serial.println();
     }
@@ -398,22 +418,12 @@ void process4096Block(const float *x)
         streamDebugFftSpectrum(fftMag);
     }
 
+    bool blockInChirp = isInChirp(blockStartSample + FFT_N / 2);
 
-    // --------------------------------------------------------
-    // Determine whether this block belongs to chirp
-    // --------------------------------------------------------
-
-    bool blockInChirp = isInChirp(totalSamples + FFT_N / 2);
-
-    // Reset the coherent accumulator at the start of each chirp window.
     if (!inChirpPrev && blockInChirp)
     {
-        resetAccumulator();
+        resetAccumulator(sumSpecRe, sumSpecIm);
     }
-
-    // --------------------------------------------------------
-    // Accumulate complex spectrum across chirp blocks.
-    // --------------------------------------------------------
 
     if (blockInChirp)
     {
@@ -426,19 +436,10 @@ void process4096Block(const float *x)
         chirpBlockCount++;
     }
 
-
-    // --------------------------------------------------------
-    // Determine whether chirp has just ended.
-    // --------------------------------------------------------
-
-    bool nowInChirp = isInChirp(totalSamples + FFT_N - 1);
+    bool nowInChirp = isInChirp(blockStartSample + FFT_N - 1);
 
     if (inChirpPrev && !nowInChirp && chirpBlockCount > 0)
     {
-        // ----------------------------------------------------
-        // Compute magnitude of accumulated spectrum
-        // ----------------------------------------------------
-
         for (uint32_t k = 0; k < FFT_N; k++)
         {
             float re = sumSpecRe[k];
@@ -446,73 +447,29 @@ void process4096Block(const float *x)
             fftMag[k] = sqrtf(re * re + im * im);
         }
 
-
-        // ----------------------------------------------------
-        // Find maximum
-        // ----------------------------------------------------
-
         float maxVal = 0.0f;
         uint32_t maxIdx = 0;
 
-        arm_max_f32(
-            fftMag,
-            FFT_N,
-            &maxVal,
-            &maxIdx
-        );
-
-
-        // ----------------------------------------------------
-        // Calculate mean spectrum magnitude
-        // ----------------------------------------------------
+        arm_max_f32(fftMag, FFT_N, &maxVal, &maxIdx);
 
         float meanVal = 0.0f;
-
-        arm_mean_f32(
-            fftMag,
-            FFT_N,
-            &meanVal
-        );
-
-
-        // ----------------------------------------------------
-        // Peak-to-average ratio
-        // ----------------------------------------------------
+        arm_mean_f32(fftMag, FFT_N, &meanVal);
 
         float ratio = maxVal / (meanVal + EPS);
-
-        // ----------------------------------------------------
-        // Convert FFT bin to frequency
-        //
-        // FFT resolution:
-        //
-        // 44100 / 4096 = 10.7666 Hz
-        // ----------------------------------------------------
-
         float peakFreq = ((float)maxIdx * FS) / FFT_N;
-
-
-        // ----------------------------------------------------
-        // Print result
-        // ----------------------------------------------------
 
         Serial.print("[STATE=DECHIRPING] ");
         Serial.print("blocks=");
         Serial.print(chirpBlockCount);
-
         Serial.print(" peakBin=");
         Serial.print(maxIdx);
-
         Serial.print(" peakFreq=");
         Serial.print(peakFreq, 3);
         Serial.print(" Hz");
-
         Serial.print(" peak=");
         Serial.print(maxVal, 6);
-
         Serial.print(" mean=");
         Serial.print(meanVal, 6);
-
         Serial.print(" ratio=");
         Serial.print(ratio, 3);
 
@@ -523,20 +480,10 @@ void process4096Block(const float *x)
 
         Serial.println();
 
-
-        // ----------------------------------------------------
-        // Ready for next SOS period
-        // ----------------------------------------------------
-
-        resetAccumulator();
+        resetAccumulator(sumSpecRe, sumSpecIm);
     }
 
-
-    // Update state
-
     inChirpPrev = nowInChirp;
-
-    totalSamples += FFT_N;
 }
 
 
@@ -660,11 +607,7 @@ void setup()
 
 void loop()
 {
-    // 4096 sample accumulation buffer
-    static float block4096[FFT_N];
-
-    static uint32_t fill = 0;
-
+    static uint32_t fftWindowStart = 0;
 
     // --------------------------------------------------------
     // Process available 128-sample Audio blocks
@@ -684,17 +627,16 @@ void loop()
         {
             float sample = (float)p[i] * (1.0f / 32768.0f);
 
-            // Feed the FFT accumulation buffer.
-            block4096[fill++] = sample;
-
-            // Feed the rough-search rolling buffer used for chirp start detection.
+            // Feed the rolling search buffer used for chirp start detection.
             searchBuf[searchHead] = sample;
             searchHead = (searchHead + 1) % CHIRP_SAMPLES;
 
-            if (fill >= FFT_N)
+            totalSamples++;
+
+            if (machineState == STATE_DECHIRPING && (totalSamples - fftWindowStart) >= FFT_N)
             {
-                process4096Block(block4096);
-                fill = 0;
+                process4096Block(fftWindowStart);
+                fftWindowStart += FFT_N;
             }
         }
 
@@ -710,6 +652,7 @@ void loop()
         if (!chirpStartFound && totalSamples >= CHIRP_SAMPLES)
         {
             machineState = STATE_SEARCHING;
+            setSearchBufferMode(BUFFER_SEARCH);
             uint32_t bestOffset = 0;
             float roughCorr = roughSearchForChirpStart(bestOffset);
             searchIterations++;
@@ -732,6 +675,8 @@ void loop()
                 chirpStartSample = totalSamples - CHIRP_SAMPLES + bestOffset;
                 chirpStartFound = true;
                 machineState = STATE_DECHIRPING;
+                setSearchBufferMode(BUFFER_DECHIRP);
+                fftWindowStart = chirpStartSample;
 
                 Serial.print("[STATE=TRANSITION] SEARCHING -> DECHIRPING sample=");
                 Serial.print(chirpStartSample);
@@ -748,8 +693,8 @@ void loop()
         {
             chirpStartFound = false;
             machineState = STATE_SILENCE;
-            memset(searchBuf, 0, sizeof(searchBuf));
-            searchHead = 0;
+            setSearchBufferMode(BUFFER_SEARCH);
+            fftWindowStart = totalSamples;
             Serial.print("[STATE=SILENCE] re-arming search after silence period at sample=");
             Serial.print(totalSamples);
             Serial.println();
