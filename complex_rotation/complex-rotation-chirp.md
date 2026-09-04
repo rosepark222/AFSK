@@ -165,7 +165,7 @@ for (int n = 0; n < N; n++) {
 }
 ```
 
-This version still computes trig for `phi_step`, but only for the changing step, not for the full chirp phase each sample. You can optimize further by updating the rotation itself recursively.
+This version still computes trig for `phi_step`, but only for the changing step, not for the full chirp phase each sample. You can optimize further by updating the rotation itself iteratively using a recurrence.
 
 ---
 
@@ -177,35 +177,155 @@ You keep:
 
 - the current complex sample `(c, s)`
 - the current rotation factors `(a, b)`
+- a fixed tiny update rotation `(ca, sa)` for how the step changes
 
-Then update both gradually.
+Then update both iteratively.
 
-This reduces the loop to:
+The loop becomes:
 
-- a few multiplies
-- a few additions
+```c
+float c = 1.0f, s = 0.0f;          // current chirp sample
+float a = cosf(phi_step0);         // current per-sample rotation
+float b = sinf(phi_step0);
+
+float ca = cosf(dphi_step);        // tiny update rotation
+float sa = sinf(dphi_step);
+
+for (int n = 0; n < N; n++) {
+    // use current reference
+    float ref_cos = c;
+    float ref_sin = s;
+
+    // advance the chirp sample
+    float next_c = c * a - s * b;
+    float next_s = s * a + c * b;
+
+    // advance the rotation factor
+    float next_a = a * ca - b * sa;
+    float next_b = b * ca + a * sa;
+
+    c = next_c;
+    s = next_s;
+    a = next_a;
+    b = next_b;
+}
+```
+
+This means:
+
+- no trig inside the loop
+- no phase recomputation
+- just arithmetic
 
 ---
 
-## Notes on numerical drift
+## Why this works
 
-Recursive methods can slowly drift due to floating-point error.
+A complex number on the unit circle can be multiplied by another unit complex number to rotate it.
 
-To control that:
+So:
 
-- occasionally renormalize `(c, s)` so that `c² + s² ≈ 1`
-- for long runs, re-anchor from an exact phase value every so often
+- chirp evolution = repeated multiplication by a varying unit rotation
+- step evolution = repeated multiplication by a tiny fixed unit rotation
 
-For a 1-second chirp, drift is usually manageable.
+This is numerically and computationally cheaper than calling trig repeatedly.
 
 ---
 
-## Summary
+## Example interpretation
 
-Complex rotation lets you generate chirp samples efficiently:
+Suppose your chirp starts at 300 Hz and ramps upward.
 
-- no per-sample `sin()` / `cos()` calls
-- fast enough for embedded real-time processing
-- ideal for large correlation loops
+At the beginning:
 
-For your Teensy code, this is a good way to save RAM while keeping compute cost reasonable.
+- `Δφ` is the phase step for 300 Hz
+- `a,b` are the rotation for that step
+
+A moment later:
+
+- `Δφ` is slightly larger
+- instead of recalculating `cos(Δφ)` and `sin(Δφ)`, you nudge `(a,b)` forward with the small update rotation `(ca, sa)`
+
+So the loop “walks” both:
+
+- the output point on the circle
+- the step size that drives that point
+
+---
+
+## What you gain
+
+This method is useful because it:
+
+- removes all per-sample trig calls
+- keeps the inner loop predictable
+- is fast on embedded CPUs
+- reduces dependence on expensive math library calls
+
+On something like a Teensy 4.1, that can matter a lot in a tight correlation or signal-generation loop.
+
+---
+
+## Tradeoff: drift
+
+The downside is floating-point error accumulates.
+
+Over time:
+
+- `(c, s)` may stop being perfectly unit length
+- `(a, b)` may drift too
+
+Common fixes:
+
+- renormalize occasionally:
+  - `mag = sqrt(c*c + s*s)`
+  - `c /= mag; s /= mag`
+- or rebuild from an exact phase every so often
+- or use fixed intervals, like every few thousand samples
+
+For short runs, this is usually fine.
+
+---
+
+## A cleaner pseudocode version
+
+```c
+float c = 1.0f, s = 0.0f;          // current chirp sample
+float a = cosf(phi_step0);         // current per-sample rotation
+float b = sinf(phi_step0);
+
+float ca = cosf(dphi_step);        // tiny update rotation
+float sa = sinf(dphi_step);
+
+for (int n = 0; n < N; n++) {
+    // use current reference
+    float ref_cos = c;
+    float ref_sin = s;
+
+    // advance chirp sample
+    float next_c = c * a - s * b;
+    float next_s = s * a + c * b;
+
+    // advance the rotation factor
+    float next_a = a * ca - b * sa;
+    float next_b = b * ca + a * sa;
+
+    c = next_c;
+    s = next_s;
+    a = next_a;
+    b = next_b;
+}
+```
+
+---
+
+## Even simpler way to think about it
+
+You are doing two iterative rotations:
+
+- **outer rotation**: the signal sample moves around the circle
+- **inner rotation**: the step size itself changes gradually
+
+That’s why the document calls it a “more efficient variant”: it eliminates trig from the hot path entirely.
+
+If you want, I can also rewrite that section of `complex-rotation-chirp.md` into a clearer embedded-style explanation with a better code example.
