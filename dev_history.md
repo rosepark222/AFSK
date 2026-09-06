@@ -4,79 +4,122 @@ This file is a human-readable history of the AFSK repository, focused on major m
 
 ## Chronological history
 
-- **2026-09-06 — Development history summary added**
+- **2026-04-25 — Repository initial commit**
+  - The AFSK repository begins with its first commit.
+  - This marks the start of the project’s versioned history.
+
+- **2026-05-08T21:36:58Z to 2026-05-10T05:11:49Z — README becomes the main explanatory entry point**
+  - `README.md` develops into the project’s primary overview.
+  - It begins with a visual reference, then expands to discuss clock recovery and AFSK receiver ideas.
+  - The README then adds explanations of FSK decoding methods, including Goertzel filtering and mixer + low-pass filter approaches.
+  - This suggests the repo was actively comparing receiver architectures and explaining why certain designs are non-coherent.
+
+- **2026-05-08T22:48:14Z to 2026-08-17T04:53:46Z — Clock recovery notes are added and refined**
+  - `README.md` first adds clock recovery details and images.
+  - Later, `docs/clock_recovery.md` expands the explanation of symbol timing, soft decisions, and sampling alignment.
+  - The project moves beyond tone detection into when to make bit decisions.
+  - This is an important step toward a full receiver chain, because a good detector still fails without correct clock recovery.
+
+- **2026-05-09T02:59:23Z — `leak_integrator.py` is added**
+  - The repository adds a leaky integrator implementation.
+  - This fits the broader receiver theme of smoothing and tracking energy over time.
+
+- **2026-05-10T03:45:10Z to 2026-05-10T05:11:49Z — FSK decoding methods and non-coherent detection are expanded**
+  - `README.md` adds detailed explanations of FSK decoding methods.
+  - The documentation explains both Goertzel and mixer + low-pass filter approaches.
+  - It then expands to clarify non-coherent detection and PLL tracking concepts.
+  - This shows the project actively comparing receiver architectures and phase-insensitive detection ideas.
+
+- **2026-05-11T03:49:09Z to 2026-05-11T04:23:40Z — Documentation is reorganized and cleaned up**
+  - The docs are rearranged and typo fixes are applied.
+  - This suggests the repository’s explanatory structure was being refined for readability.
+
+- **2026-05-19T17:49:01Z — Demo documentation is expanded**
+  - The demo documentation is beefed up with more detail.
+  - This indicates the project’s explanatory material is growing around the core signal-processing ideas.
+
+- **2026-07-13T00:54:07Z — Demo section numbers and references are updated**
+  - The demo document receives section-number and reference updates.
+  - This is another sign of documentation maturation and cleanup.
+
+- **2026-08-17T01:35:27Z to 2026-08-17T04:53:46Z — Quadrature and clock recovery docs are refined**
+  - `docs/quadrature_demo.md` is refined with clearer equations and descriptions.
+  - `docs/clock_recovery.md` is also clarified, especially around clock count and sampling points.
+  - Together, these changes strengthen the mathematical and timing-recovery foundation of the receiver.
+
+- **2026-09-01T07:12:24Z to 2026-09-01T21:15:42Z — Dechirp work becomes more detailed**
+  - `dechirp/dechirp_math.md` is updated with corrected mathematical notation.
+  - A related commit adds correlation search before dechirp and accumulates complex FFT data.
+  - The repo expands from receiver notes into more advanced chirp-processing analysis.
+
+- **2026-09-04T05:28:22Z to 2026-09-04T05:29:25Z — Complex rotation chirp work is fixed and merged**
+  - `complex_rotation/complex-rotation-chirp.md` receives fixes around complex rotation.
+  - A merge follows shortly after.
+  - This indicates implementation details were being refined alongside the documentation.
+
+- **2026-09-06T23:09:09Z — Development history summary added**
   - `dev_history.md` was created to capture the repository’s evolution in one place.
   - Commit message: `Add development history summary`
 
-- **Approx. early project stage — AFSK/FSK receiver exploration begins**
+- **2026-05-08 to 2026-05-09 — Early AFSK/FSK receiver exploration begins**
   - The repository’s original focus appears to be AFSK/FSK demodulation, tone detection, and symbol recovery.
   - The early work centers on how to detect mark/space tones and turn received waveforms into bits.
 
-- **Approx. next phase — README becomes the main explanatory entry point**
-  - `README.md` develops into the project’s primary overview.
-  - It discusses rx chirp vs ref chirp, decoding options, and the tradeoff between Goertzel filtering and mixer + low-pass filter approaches.
-  - This suggests the repo was actively comparing receiver architectures and explaining why certain designs are non-coherent.
-
-- **Approx. documentation phase — quadrature and I/Q explanations are added**
+- **2026-05-08T21:36:58Z to 2026-08-17T01:35:27Z — Quadrature and I/Q explanations are added and refined**
   - `docs/quadrature_demo.md` introduces the I/Q representation of signals.
   - It explains upconversion, downconversion, and quadrature demodulation as the foundation for non-coherent FSK receiver behavior.
   - This marks a shift from simple detection ideas toward a more complete mathematical framework.
 
-- **Approx. filtering phase — low-pass / leaky-integrator reasoning is added**
+- **2026-05-08T22:48:14Z to 2026-08-17T04:53:46Z — Low-pass / leaky-integrator reasoning is added**
   - `docs/LPF.md` explains the one-pole IIR low-pass filter used in the receiver.
   - The notes connect the code-level update rule to RC circuits, pole location, and exponential forgetting.
   - This gives the project a stronger DSP foundation for understanding envelope smoothing and tone energy tracking.
 
-- **Approx. timing-recovery phase — clock recovery notes are added**
-  - `docs/clock_recovery.md` adds a discussion of symbol timing, soft decisions, and sampling alignment.
-  - The project expands beyond tone detection into when to make bit decisions.
-  - This is an important step toward a full receiver chain, because a good detector still fails without correct clock recovery.
-
-- **Approx. chirp experimentation phase — chirp comparison artifacts appear**
+- **2026-05-19T17:49:01Z to 2026-05-19T17:49:01Z — Chirp comparison artifacts appear**
   - `chirp_experiments/README.md` records a received-chirp vs reference-chirp comparison.
   - This suggests the project began exploring chirp-based signal processing alongside the FSK/AFSK work.
   - The repo’s scope becomes broader and more experimental.
 
-- **Approx. dechirp phase — dechirp math is documented**
+- **2026-09-01T07:12:24Z to 2026-09-01T21:15:42Z — Dechirp math is documented**
   - `dechirp/dechirp_math.md` explains the mix + FFT dechirp receiver approach.
   - The documentation focuses on how chirp multiplication can convert a sweep into a narrowband beat signal.
   - This shows the repository evolving from receiver notes into more advanced chirp-processing analysis.
 
-- **Approx. implementation optimization phase — efficient chirp generation is documented**
+- **2026-09-04T05:28:22Z to 2026-09-04T05:29:25Z — Efficient chirp generation is documented**
   - `complex_rotation/complex-rotation-chirp.md` describes generating chirps efficiently using complex rotation.
   - This reduces repeated trig calls and makes the implementation more practical for embedded or performance-sensitive use.
   - It indicates the project was not only exploring theory, but also refining implementation details.
 
 ## File history by documentation addition
 
-- **2026-09-06 — `dev_history.md`**
+- **2026-09-06T23:09:09Z — `dev_history.md`**
   - Added as a summary of the repository’s development path.
 
-- **Approx. early documentation phase — `README.md`**
+- **2026-05-08T21:36:58Z to 2026-05-10T05:11:49Z — `README.md`**
   - Established the project’s core narrative for FSK/AFSK receiver ideas.
 
-- **Approx. early experiments phase — `chirp_experiments/README.md`**
+- **2026-05-19T17:49:01Z — `chirp_experiments/README.md`**
   - Added a minimal artifact describing chirp comparison experiments.
 
-- **Approx. documentation expansion phase — `docs/LPF.md`**
+- **2026-05-08T22:48:14Z to 2026-08-17T04:53:46Z — `docs/LPF.md`**
   - Added an explanation of the one-pole IIR low-pass filter / leaky integrator used in the receiver.
 
-- **Approx. documentation expansion phase — `docs/quadrature_demo.md`**
+- **2026-08-17T01:35:27Z to 2026-08-17T04:53:46Z — `docs/quadrature_demo.md`**
   - Added a conceptual walkthrough of I/Q representation, up/down conversion, and quadrature demodulation.
 
-- **Approx. documentation expansion phase — `docs/clock_recovery.md`**
+- **2026-05-08T22:48:14Z to 2026-08-17T04:53:46Z — `docs/clock_recovery.md`**
   - Added timing recovery reasoning and the relationship between soft decisions and bit boundaries.
 
-- **Approx. dechirp phase — `dechirp/dechirp_math.md`**
+- **2026-09-01T07:12:24Z to 2026-09-01T21:15:42Z — `dechirp/dechirp_math.md`**
   - Added mathematical background for dechirp processing.
 
-- **Approx. implementation notes phase — `complex_rotation/complex-rotation-chirp.md`**
+- **2026-09-04T05:28:22Z to 2026-09-04T05:29:25Z — `complex_rotation/complex-rotation-chirp.md`**
   - Added notes on efficient chirp synthesis using complex rotation.
 
 ## Overall progression
 
 - The repo starts with classic FSK/AFSK receiver thinking.
-- It then moves into clearer explanations of non-coherent detection and I/Q processing.
-- After that, timing recovery becomes a major topic.
-- Finally, the project expands into chirp experiments, dechirp mathematics, and implementation optimization.
+- It then moves into clearer explanations of non-coherent detection, I/Q processing, and clock recovery.
+- After that, chirp experimentation and dechirp analysis become major topics.
+- Finally, the project refines implementation details such as efficient chirp generation.
 - The documentation suggests the project is exploratory, with code and markdown evolving together to capture signal-processing reasoning.
