@@ -162,7 +162,7 @@ static constexpr uint32_t BLOCKS_PER_CHIRP = (CHIRP_SAMPLES + FFT_N - 1) / FFT_N
 
 // Detection threshold
 static constexpr float DETECT_RATIO_THRESHOLD = 8.0f;
-static constexpr float ROUGH_SEARCH_THRESHOLD = 0.08f;
+static constexpr float ROUGH_SEARCH_THRESHOLD = 0.04f;
 static constexpr float EPS = 1e-12f;
 
 // Streamed FFT-magnitude debug capture.
@@ -188,8 +188,6 @@ AudioInputI2S       i2s1;
 AudioRecordQueue    queue1;
 
 AudioConnection patchCord1(i2s1, 0, queue1, 0);
-
-AudioControlSGTL5000 sgtl5000;
 
 
 // ============================================================
@@ -812,19 +810,19 @@ void setup()
     AudioMemory(120);
 
 
-    // --------------------------------------------------------
-    // SGTL5000
-    // --------------------------------------------------------
+    // // --------------------------------------------------------
+    // // SGTL5000
+    // // --------------------------------------------------------
 
-    sgtl5000.enable();
+    // sgtl5000.enable();
 
-    sgtl5000.inputSelect(
-        AUDIO_INPUT_LINEIN
-    );
+    // sgtl5000.inputSelect(
+    //     AUDIO_INPUT_LINEIN
+    // );
 
-    sgtl5000.lineInLevel(5);
+    // sgtl5000.lineInLevel(5);
 
-    sgtl5000.volume(0.5);
+    // sgtl5000.volume(0.5);
 
 
     // --------------------------------------------------------
@@ -899,7 +897,9 @@ void setup()
     Serial.println("[STATE=SEARCHING] machine started in search mode");
 
 
- 
+    if (SD.exists("afsk_log.txt")) {
+        SD.remove("afsk_log.txt");
+    }
 
     logFile = SD.open("afsk_log.txt", FILE_WRITE);
     if (logFile) { Serial.println("afsk_log.txt opened"); }
@@ -1003,7 +1003,8 @@ void loop()
                 // logFilePrint(logBuf);
             searchIterations++;
             //Serial.print("2.2-"); 
-            Serial.println(roughCorr);
+            //if(roughCorr > 0.001) 
+                Serial.println(roughCorr, 6);
 
             // if ((searchIterations % 20u) == 0u || roughCorr > ROUGH_SEARCH_THRESHOLD)
             // {
@@ -1019,6 +1020,17 @@ void loop()
 
             if (roughCorr > ROUGH_SEARCH_THRESHOLD)
             {
+
+                snprintf(logBuf, sizeof(logBuf), "SEARCHING -> DECHIRPING roughCorr %7.4f", roughCorr); 
+                logFilePrint(logBuf);
+
+                // dumpSearchBuf();
+                for (uint32_t n = 0; n < CHIRP_SAMPLES; n++) {
+                    uint32_t idx = (searchHead + n) % CHIRP_SAMPLES;
+                    float rx = searchBuf[idx];
+                    logFile.println(rx, 8);
+                }
+
                 chirpStartSample = totalSamples - CHIRP_SAMPLES;
                 chirpStartFound = true;
                 machineState = STATE_DECHIRPING;
@@ -1036,8 +1048,9 @@ void loop()
 
                 digitalWrite(STATUS_1_PIN, HIGH); 
 
-                snprintf(logBuf, sizeof(logBuf), "SEARCHING -> DECHIRPING roughCorr %7.4f", roughCorr); 
-                logFilePrint(logBuf);
+
+
+
             }
         }
         //Serial.print("2.3 ");
