@@ -5,7 +5,95 @@
 ---------------------------------------------------------------------------
 ---------------------------------------------------------------------------
 ---------------------------------------------------------------------------
+9/8
+Q:
+if I know the timing of chirp start in two mic , the difference is TDOA ?
+
+
+A:
+Yes, exactly. If you measure the exact arrival time of a chirp signal at microphone A and microphone B, subtracting one time from the other gives you the TDOA (Time Difference of Arrival).
+$$\text{TDOA} = t_{\text{mic B}} - t_{\text{mic A}}$$ 
+Because you are using a chirp (a frequency sweep), you have chosen the absolute best signal type for this. However, getting the exact start time of a signal in the real world can be very tricky because of background noise and room echoes (multipath).
+Since you are already calculating a single-lag correlation, you can use cross-correlation to find your TDOA with microsecond precision.
+------------------------------
+## How to turn your Correlation into TDOA
+Instead of just calculating a single zero-lag correlation, you can slide one microphone's signal past the other by just a small window of samples (lags) around the expected delay.
+
+   1. Calculate the Correlation Curve: Compute the dot product for a narrow range of sample shifts (e.g., shifting Signal B by -100 to +100 samples relative to Signal A).
+   2. Find the Peak: The specific shift value (lag) that produces the highest correlation score is your time difference in samples.
+   3. Convert to Time: Divide that sample shift by your sample rate (44,100 Hz).
+
+$$\text{TDOA (seconds)} = \frac{\text{Sample Shift at Peak}}{44100}$$ 
+## Why this is perfect for the Teensy 4.0
+Earlier, we looked at how calculating a massive 44,100-sample shift window takes 3.2 seconds. But for acoustics and microphones, you only need a tiny shift window.
+Sound travels through the air at roughly 343 meters per second.
+
+* If your two microphones are spaced 1 meter apart, the maximum possible time delay between them is only about 2.9 milliseconds.
+* At a 44,100 Hz sample rate, 2.9 milliseconds is only 128 samples (0.0029 × 44100).
+
+This means you only need to compute the correlation across a window of 256 total lags (from -128 to +128 samples) to capture every possible angle.
+## The Performance Math:
+Instead of doing a massive 44,100 × 44,100 grid, your Teensy only has to do:
+$$44,100 \text{ multiplications} \times 256 \text{ lags} = \mathbf{11,289,600 \text{ operations}}$$ 
+At 600 MHz, the Teensy 4.0 can compute this full 1-meter tracking window in under 20 milliseconds, allowing you to update your TDOA calculation more than 50 times per second in real-time.
+To help calculate the exact code parameters for your TDOA setup, tell me:
+
+* What is the physical distance between your two microphones?
+* Are you planning to use this TDOA to calculate the angle/direction of the sound source?
+
+
+
 ---------------------------------------------------------------------------
+9/7
+Q:
+roughSearchForChirpStart estiamte per 128 samples and detects about the time chirp is aligned with the reference. At this moment, we can do cross correlation between the searchBuf and reference. Because 1 sec teensy can do more than 10,000 of 44100 multilication-accumulation, 1 sec is more than enough to get the max correlation and determine if this is peak or not. This avoid entire mix-fft , which is fundamentally limited by frequency resolution of 4096 FFT. What do you think ? 
+
+A:
+Yes — that’s a good direction, and your reasoning is solid.
+
+If your goal is **precise chirp start timing**, then doing a **full cross-correlation refinement in time domain** after rough trigger is often better than relying on 4096-block dechirp+FFT timing. FFT path is great for tone/energy decision:ws, but start-time resolution is block-quantized unless you add overlap/interpolation.
+
+## Why this makes sense
+- You already run a rough normalized correlation (`roughSearchForChirpStart`).
+- Once roughCorr crosses threshold, you can spend the next ~1 s compute budget to:
+  1. scan offsets around the rough start,
+  2. find max normalized correlation,
+  3. lock `chirpStartSample` at the true peak.
+- Teensy 4.1 has enough MAC throughput for this windowed refinement.
+
+## Suggested practical design
+Use a **two-stage detector**:
+
+1. **Stage A (current):** cheap streaming rough search every 128 samples.
+2. **Stage B (new):** on trigger, run bounded peak search:
+   - Search offsets in a local window, e.g. `[-4096, +4096]` or wider.
+   - Compute normalized corr at each lag.
+   - Pick best lag and optionally do **parabolic interpolation** around peak for sub-sample estimate.
+3. Then start dechirp/FFT using refined start (if you still need spectral detection).
+
+## Key optimization note
+A naïve full 1-sec × many-lags correlation can get expensive if repeated heavily. To keep it safe:
+- Decimate/coarse-to-fine (e.g., step 8 first, then step 1 near best).
+- Restrict lag window around rough trigger.
+- Reuse running sums if possible for normalization.
+- Consider doing refinement once per candidate burst only.
+
+## Important bug risk in your current file
+You currently call:
+```cpp
+setSearchBufferMode(BUFFER_DECHIRP);
+```
+and inside it:
+```cpp
+memset(searchBuf, 0, sizeof(searchBuf));
+```
+This clears `searchBuf` exactly when you transition to DECHIRPING. Since `process4096Block()` reads from `searchBuf`, this can destroy alignment/data continuity.  
+If you adopt correlation-based precise lock, you should avoid clearing active raw-audio history on transition.
+
+## Bottom line
+Your proposal is better for **timing alignment** and can reduce dependence on 4096 FFT resolution limits. I’d keep FFT for symbol/frequency decision if needed, but use **time-domain cross-correlation peak lock** as the alignment authority.
+
+
 ---------------------------------------------------------------------------
 9/3
 In embedded systems like Teensy, it is often better to allocate one large memory pool up front and manage it yourself if your application has distinct phases that never overlap.
