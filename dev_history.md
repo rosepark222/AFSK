@@ -1,8 +1,39 @@
+- **2026-09-06 -- corr peak detected, 
+[1970-01-01 00:00:11.952] SEARCHING -> DECHIRPING roughCorr  0.2890
+[1970-01-01 00:00:12.027] process4096Block starts
+[1970-01-01 00:00:12.028] process4096Block finished
+[1970-01-01 00:00:12.028] process4096Block starts
+[1970-01-01 00:00:12.029] process4096Block finished
+[1970-01-01 00:00:12.029] process4096Block starts
+[1970-01-01 00:00:12.030] process4096Block finished
+[1970-01-01 00:00:12.030] process4096Block starts
+[1970-01-01 00:00:12.030] process4096Block finished
+[1970-01-01 00:00:12.030] process4096Block starts
+[1970-01-01 00:00:12.031] process4096Block finished
+[1970-01-01 00:00:12.031] process4096Block starts
+[1970-01-01 00:00:12.032] process4096Block finished
+[1970-01-01 00:00:12.032] process4096Block starts
+[1970-01-01 00:00:12.033] process4096Block finished
+[1970-01-01 00:00:12.033] process4096Block starts
+[1970-01-01 00:00:12.033] process4096Block finished
+[1970-01-01 00:00:12.034] process4096Block starts
+[1970-01-01 00:00:12.034] process4096Block finished
+[1970-01-01 00:00:12.034] process4096Block starts
+[1970-01-01 00:00:12.035] process4096Block finished
+[1970-01-01 00:00:12.035] process4096Block starts
+[1970-01-01 00:00:12.036] [STATE=DECHIRPING] blocks=011 peakBin=3956 peakFreq=42592.676 Hz peak=4.408007 mean=0.034032 ratio=129.526  --> DETECT
+
+when i added log, I got the above . it seems the mix-fft (dechirp) starts 75ms later the correlation detected. the mix-fft should perform for the 1sec searchBuf of peak correlation, or wait for 2 sec and wait for next chirp ( 1sec chirp + 2sec silence ) pattern. The current code does not seem doing so. Explain isInChirp, noinChirp usage, which is very confusing to me. 
+
+
 # Development History
 
 This file is a human-readable history of the AFSK repository, focused on major milestones, new file additions, and markdown documentation growth.
 
 ## Chronological history
+
+
+
 
 - **2026-04-25 — Repository initial commit**
   - The AFSK repository begins with its first commit.
