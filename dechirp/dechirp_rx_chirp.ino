@@ -92,6 +92,33 @@ hann4096[FFT_N]
 16 KB
 
 176 + 32.8 + 16 + 16 + 16 + 16 ≈ 272.8 KB
+
+
+log file:
+[1970-01-01 00:00:11.952] SEARCHING -> DECHIRPING roughCorr  0.2890
+[1970-01-01 00:00:12.027] process4096Block starts
+[1970-01-01 00:00:12.028] process4096Block finished
+[1970-01-01 00:00:12.028] process4096Block starts
+[1970-01-01 00:00:12.029] process4096Block finished
+[1970-01-01 00:00:12.029] process4096Block starts
+[1970-01-01 00:00:12.030] process4096Block finished
+[1970-01-01 00:00:12.030] process4096Block starts
+[1970-01-01 00:00:12.030] process4096Block finished
+[1970-01-01 00:00:12.030] process4096Block starts
+[1970-01-01 00:00:12.031] process4096Block finished
+[1970-01-01 00:00:12.031] process4096Block starts
+[1970-01-01 00:00:12.032] process4096Block finished
+[1970-01-01 00:00:12.032] process4096Block starts
+[1970-01-01 00:00:12.033] process4096Block finished
+[1970-01-01 00:00:12.033] process4096Block starts
+[1970-01-01 00:00:12.033] process4096Block finished
+[1970-01-01 00:00:12.034] process4096Block starts
+[1970-01-01 00:00:12.034] process4096Block finished
+[1970-01-01 00:00:12.034] process4096Block starts
+[1970-01-01 00:00:12.035] process4096Block finished
+[1970-01-01 00:00:12.035] process4096Block starts
+[1970-01-01 00:00:12.036] [STATE=DECHIRPING] blocks=011 peakBin=3956 peakFreq=42592.676 Hz peak=4.408007 mean=0.034032 ratio=129.526  --> DETECT
+
 */
 
 #include <Arduino.h>
@@ -100,6 +127,7 @@ hann4096[FFT_N]
 #include <MTP_Teensy.h>
 #include <arm_math.h>
 #include <arm_const_structs.h>
+#include <TimeLib.h>
 
 // refEnergy is not the chirp waveform itself.
 // It is a running normalization metric computed while generating the reference chirp,
@@ -145,9 +173,11 @@ static constexpr uint32_t DEBUG_CAPTURE_SAMPLES = DEBUG_CAPTURE_BLOCKS * FFT_N;
 static constexpr uint32_t DEBUG_FLUSH_INTERVAL = 1u;
 
 static constexpr uint8_t MODE_BUTTON_PIN = 0;
+static constexpr uint8_t STATUS_1_PIN = 1;
 static constexpr size_t MALLOC_TEST_SIZE = 1024u;
 bool isDSP = true;
 uint8_t *mallocTest = nullptr;
+    
 
 
 // ============================================================
@@ -198,6 +228,9 @@ static BufferMode searchBufferMode = BUFFER_SEARCH;
 static float hann4096[FFT_N];
 
 File debugFftFile;
+File logFile;
+char logBuf[200];
+
 uint32_t debugWriteCount = 0;
 
 
@@ -233,10 +266,8 @@ struct ChirpState {
 
 static void enterMtpMode()
 {
-    if (debugFftFile)
-    {
-        debugFftFile.close();
-    }
+    if (debugFftFile) { debugFftFile.close(); }
+    if (logFile) { logFile.close(); }
 
     debugCaptureStarted = false;
     debugCaptureDone = false;
@@ -444,6 +475,7 @@ float roughSearchForChirpStart()
     float refS = 0.0f;
     float rotA = arm_cos_f32(phi0);
     float rotB = arm_sin_f32(phi0);
+        //Serial.print(" 2.11 ");
 
     for (uint32_t n = 0; n < CHIRP_SAMPLES; n++)
     {
@@ -463,8 +495,16 @@ float roughSearchForChirpStart()
         rotA = nextRotA;
         rotB = nextRotB;
     }
-
     float denom = sqrtf(rxEnergy * refEnergy) + EPS;
+
+    if(0) {
+     Serial.print(" rxEnergy "); Serial.print( rxEnergy);
+     Serial.print(" refEnergy "); Serial.print(  refEnergy);
+     Serial.print(" denom "); Serial.print(  denom);
+     Serial.print(" acc "); Serial.print(  acc);    
+    }
+
+
     return fabsf(acc) / denom;
 }
 
@@ -504,6 +544,8 @@ void writeDebugCaptureFiles()
 
 void streamDebugFftSpectrum(const float *mag)
 {
+    return; // do not do any for now
+
     if (!debugFftFile)
     {
         return;
@@ -633,10 +675,10 @@ void process4096Block(uint32_t blockStartSample)
         Serial.println();
     }
 
-    if (ENABLE_DEBUG_CAPTURE && debugCaptureStarted && !debugCaptureDone)
-    {
-        streamDebugFftSpectrum(fftMag);
-    }
+    // if (ENABLE_DEBUG_CAPTURE && debugCaptureStarted && !debugCaptureDone)
+    // {
+    //     streamDebugFftSpectrum(fftMag);
+    // }
 
     bool blockInChirp = isInChirp(blockStartSample + FFT_N / 2);
 
@@ -693,9 +735,17 @@ void process4096Block(uint32_t blockStartSample)
         Serial.print(" ratio=");
         Serial.print(ratio, 3);
 
+
+
         if (ratio > DETECT_RATIO_THRESHOLD)
         {
+
             Serial.print("  --> DETECT");
+
+            snprintf(logBuf, sizeof(logBuf),
+                    "[STATE=DECHIRPING] blocks=%03lu peakBin=%03lu peakFreq=%.3f Hz peak=%.6f mean=%.6f ratio=%.3f  --> DETECT",
+                    chirpBlockCount, maxIdx, peakFreq, maxVal, meanVal, ratio);
+            logFilePrint(logBuf);
         }
 
         Serial.println();
@@ -727,6 +777,11 @@ void setup()
     }
 
     pinMode(MODE_BUTTON_PIN, INPUT_PULLUP);
+    pinMode(STATUS_1_PIN, OUTPUT);
+    digitalWrite(STATUS_1_PIN, LOW);
+    digitalWrite(STATUS_1_PIN, HIGH); 
+    delay(10);
+    digitalWrite(STATUS_1_PIN, LOW);
 
     if (SD.begin(BUILTIN_SDCARD))
     {
@@ -842,16 +897,38 @@ void setup()
     Serial.println("Using arm_cfft_sR_f32_len4096");
     Serial.println("Detector ready.");
     Serial.println("[STATE=SEARCHING] machine started in search mode");
+
+
+ 
+
+    logFile = SD.open("afsk_log.txt", FILE_WRITE);
+    if (logFile) { Serial.println("afsk_log.txt opened"); }
+    else { Serial.println("Failed to open afsk_log.txt"); }
 }
 
 
 // ============================================================
 // Main loop
 // ============================================================
+void logFilePrint(const char* message) {
+    if (logFile) {
+        char timestamp[32];
+        // Formats: YYYY-MM-DD HH:MM:SS.mmm (where mmm is millis % 1000)
+        snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02d %02d:%02d:%02d.%03lu",
+                year(), month(), day(), hour(), minute(), second(), millis() % 1000);
+
+        logFile.print("[");
+        logFile.print(timestamp);
+        logFile.print("] ");
+        logFile.println(message);
+        //logFile.close();
+    }
+}
 
 void loop()
 {
     static uint32_t fftWindowStart = 0;
+
 
     if (!isDSP)
     {
@@ -872,7 +949,9 @@ void loop()
     // AUDIO_BLOCK_SAMPLES is already defined by Teensy Audio
     // library, so we do NOT redefine it.
     // --------------------------------------------------------
-        Serial.print("0 ");
+        //Serial.print("0 ");
+
+    // too many logFilePrint("loop start");
 
     while (queue1.available() > 0)
     {
@@ -881,7 +960,7 @@ void loop()
         if (!p)
             break;
 
-        Serial.println("1 ");
+        //Serial.println("1 ");
 
         for (uint32_t i = 0; i < AUDIO_BLOCK_SAMPLES; i++)
         {
@@ -895,11 +974,17 @@ void loop()
 
             if (machineState == STATE_DECHIRPING && (totalSamples - fftWindowStart) >= FFT_N)
             {
+                snprintf(logBuf, sizeof(logBuf), "process4096Block starts"); 
+                logFilePrint(logBuf);
+
                 process4096Block(fftWindowStart);
                 fftWindowStart += FFT_N;
+
+                snprintf(logBuf, sizeof(logBuf), "process4096Block finished"); 
+                logFilePrint(logBuf);
             }
         }
-        Serial.println("2 "); Serial.print(totalSamples); Serial.println();
+        //Serial.println("2 "); Serial.print(totalSamples); Serial.println();
 
         // Phase 1: searchBuf is a CHIRP_SAMPLES-sample circular ring used for rough
         // chirp-start detection. It is only indexed through searchHead / ring math here.
@@ -909,24 +994,28 @@ void loop()
         // FFT/data workspace for the dechirp path.
         if (!chirpStartFound && totalSamples >= CHIRP_SAMPLES)
         {
-        Serial.print("2.1");
+            //Serial.print("2.1");
             machineState = STATE_SEARCHING;
+                // snprintf(logBuf, sizeof(logBuf), "roughSearchForChirpStart starts"); 
+                // logFilePrint(logBuf);
             float roughCorr = roughSearchForChirpStart();
+                // snprintf(logBuf, sizeof(logBuf), "roughSearchForChirpStart end roughCorr %7.4f", roughCorr); 
+                // logFilePrint(logBuf);
             searchIterations++;
-        Serial.print("2.2-"); 
-        Serial.print(searchIterations);
+            //Serial.print("2.2-"); 
+            Serial.println(roughCorr);
 
-            if ((searchIterations % 20u) == 0u || roughCorr > ROUGH_SEARCH_THRESHOLD)
-            {
-                Serial.print("[STATE=SEARCHING] iter=");
-                Serial.print(searchIterations);
-                Serial.print(" sample=");
-                Serial.print(totalSamples);
-                Serial.print(" corr=");
-                Serial.print(roughCorr, 4);
-                Serial.println();
-            }
-        Serial.print("2.3 ");
+            // if ((searchIterations % 20u) == 0u || roughCorr > ROUGH_SEARCH_THRESHOLD)
+            // {
+            //     Serial.print("[STATE=SEARCHING] iter=");
+            //     Serial.print(searchIterations);
+            //     Serial.print(" sample=");
+            //     Serial.print(totalSamples);
+            //     Serial.print(" corr=");
+            //     Serial.print(roughCorr, 4);
+            //     Serial.println();
+            // }
+            //Serial.print("2.3 ");
 
             if (roughCorr > ROUGH_SEARCH_THRESHOLD)
             {
@@ -944,9 +1033,14 @@ void loop()
                 Serial.print(" corr=");
                 Serial.print(roughCorr, 4);
                 Serial.println();
+
+                digitalWrite(STATUS_1_PIN, HIGH); 
+
+                snprintf(logBuf, sizeof(logBuf), "SEARCHING -> DECHIRPING roughCorr %7.4f", roughCorr); 
+                logFilePrint(logBuf);
             }
         }
-        Serial.print("2.3 ");
+        //Serial.print("2.3 ");
 
         // When the chirp ends, re-arm the search for the next burst.
         if (chirpStartFound && !debugCaptureDone && totalSamples > chirpStartSample + CHIRP_SAMPLES + (uint32_t)(SILENCE_DUR_S * FS))
@@ -959,6 +1053,9 @@ void loop()
             Serial.print(totalSamples);
             Serial.println();
             searchIterations = 0;
+
+            snprintf(logBuf, sizeof(logBuf), "chirp end, STATE_SILENCE"); 
+            logFilePrint(logBuf);
         }
 
         if (chirpStartFound && machineState == STATE_DECHIRPING)
