@@ -174,9 +174,9 @@ static constexpr uint32_t DEBUG_FLUSH_INTERVAL = 1u;
 
 static constexpr uint8_t MODE_BUTTON_PIN = 0;
 static constexpr uint8_t STATUS_1_PIN = 1;
-static constexpr size_t MALLOC_TEST_SIZE = 1024u;
+static constexpr size_t MALLOC_TEST_SIZE = CHIRP_SAMPLES*sizeof(float); 
 bool isDSP = true;
-uint8_t *mallocTest = nullptr;
+float *mallocTest = nullptr;
     
 
 
@@ -479,6 +479,7 @@ float roughSearchForChirpStart()
     {
         uint32_t idx = (searchHead + n) % CHIRP_SAMPLES;
         float rx = searchBuf[idx];
+        mallocTest[n] = refC; // save
 
         acc += rx * refC;
         rxEnergy += rx * rx;
@@ -763,17 +764,6 @@ void setup()
 {
     Serial.begin(115200);
 
-    mallocTest = static_cast<uint8_t *>(malloc(MALLOC_TEST_SIZE));
-    if (mallocTest != nullptr)
-    {
-        memset(mallocTest, 0, MALLOC_TEST_SIZE);
-        Serial.println("mallocTest allocated and cleared: 1024 bytes");
-    }
-    else
-    {
-        Serial.println("mallocTest allocation failed");
-    }
-
     pinMode(MODE_BUTTON_PIN, INPUT_PULLUP);
     pinMode(STATUS_1_PIN, OUTPUT);
     digitalWrite(STATUS_1_PIN, LOW);
@@ -904,6 +894,26 @@ void setup()
     logFile = SD.open("afsk_log.txt", FILE_WRITE);
     if (logFile) { Serial.println("afsk_log.txt opened"); }
     else { Serial.println("Failed to open afsk_log.txt"); }
+
+
+    mallocTest = static_cast<float *>(malloc(MALLOC_TEST_SIZE));
+    if (mallocTest != nullptr)
+    {
+        memset(mallocTest, 0, MALLOC_TEST_SIZE);
+        // for (uint32_t n = 0; n < CHIRP_SAMPLES; n++) {
+        //     mallocTest[n] = 1.0f;
+        // } 
+        // mallocTest[0] = 1.0f;
+        // mallocTest[1] = 2.0f;
+        // mallocTest[2] = 3.0f;
+
+        Serial.print("mallocTest allocated and cleared: ");
+        Serial.println(MALLOC_TEST_SIZE);
+    }
+    else
+    {
+        Serial.println("mallocTest allocation failed");
+    }
 }
 
 
@@ -1021,6 +1031,8 @@ void loop()
             if (roughCorr > ROUGH_SEARCH_THRESHOLD)
             {
 
+              bool dumpLog = true; 
+              if(dumpLog) {
                 snprintf(logBuf, sizeof(logBuf), "SEARCHING -> DECHIRPING roughCorr %7.4f", roughCorr); 
                 logFilePrint(logBuf);
 
@@ -1030,7 +1042,17 @@ void loop()
                     float rx = searchBuf[idx];
                     logFile.println(rx, 8);
                 }
+                    
+                logFile.println("==ref starts====");
 
+                for (uint32_t n = 0; n < CHIRP_SAMPLES; n++) {
+                    //uint32_t idx = (searchHead + n) % CHIRP_SAMPLES;
+                    //float rx = searchBuf[idx];
+                    logFile.println(mallocTest[n], 8);
+                } 
+
+                logFile.println("==ref ends====");
+              }
                 chirpStartSample = totalSamples - CHIRP_SAMPLES;
                 chirpStartFound = true;
                 machineState = STATE_DECHIRPING;
@@ -1088,4 +1110,3 @@ void loop()
         delay(500);
     }
 }
-
