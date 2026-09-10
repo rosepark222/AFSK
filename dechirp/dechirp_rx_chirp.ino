@@ -127,10 +127,27 @@ static constexpr uint32_t DEBUG_FLUSH_INTERVAL = 1u;
 static constexpr uint8_t MODE_BUTTON_PIN = 0;
 static constexpr uint8_t STATUS_1_PIN = 1;
 
+// ------------------------------------------------------------
+// Runtime switch: set to false to disable ALL right-channel (queue2) work --
+// no queue2.begin()/.end(), no rightBuf allocation, no rightBuf writes, no
+// queue2.readBuffer()/.freeBuffer(). With this false the sketch behaves as a
+// left-channel-only capture/search, which is the safe fallback while
+// debugging the memory/hang issue.
+// ------------------------------------------------------------
+static bool rightBufEnable = true;
+
 // do not forget to *sizeof(type) -- otherwise strange things will happen
-static constexpr size_t MALLOC_TEST_SIZE = CHIRP_SAMPLES*sizeof(float)*2; 
+//
+// Each channel now gets its own dynamically-allocated CHIRP_SAMPLES-length
+// ring buffer instead of one combined mallocTest[] array. leftBuf is always
+// allocated; rightBuf is only allocated (and only ever touched) when
+// rightBufEnable is true.
+static constexpr size_t CHANNEL_BUF_SIZE = CHIRP_SAMPLES * sizeof(float);
+
 bool isDSP = true;
-float *mallocTest = nullptr;
+
+float *leftBuf = nullptr;   // left-channel  rx ring, always allocated
+float *rightBuf = nullptr;  // right-channel rx ring, allocated only if rightBufEnable
     
 
 
@@ -139,9 +156,13 @@ float *mallocTest = nullptr;
 // ============================================================
 
 AudioInputI2S       i2s1;
-AudioRecordQueue    queue1;
+AudioRecordQueue    queue1;   // left channel  (i2s1 output 0)
+AudioRecordQueue    queue2;   // right channel (i2s1 output 1) -- only started/read if rightBufEnable
 
 AudioConnection patchCord1(i2s1, 0, queue1, 0);
+AudioConnection patchCord2(i2s1, 1, queue2, 0);
+// patchCord2 always exists (required at compile time), but is inert unless
+// queue2.begin() is called, which only happens when rightBufEnable is true.
 
 
 // ============================================================
@@ -153,8 +174,10 @@ AudioConnection patchCord1(i2s1, 0, queue1, 0);
 // AudioMemory() and the audio queue are also allocated.
 static float refEnergy = 0.0f;
 
-// Phase 1: search buffer for rough chirp-start detection.
-// This remains a CHIRP_SAMPLES-sample circular ring while searching for the burst.
+// Phase 1: reference chirp buffer.
+// searchBuf holds the fixed reference chirp waveform (loaded once from SD in
+// buildReferenceChirp()), indexed linearly 0..CHIRP_SAMPLES-1. It is not a
+// live rx ring -- that role belongs to leftBuf / rightBuf above.
 static float searchBuf[CHIRP_SAMPLES];
 static uint32_t searchHead = 0;
 
@@ -228,6 +251,10 @@ static void enterMtpMode()
     debugCaptureDone = false;
     debugWriteCount = 0;
     queue1.end();
+    if (rightBufEnable)
+    {
+        queue2.end();
+    }
     isDSP = false;
 
 }
@@ -235,6 +262,10 @@ static void enterMtpMode()
 static void enterDspMode()
 {
     queue1.begin();
+    if (rightBufEnable)
+    {
+        queue2.begin();
+    }
     isDSP = true;
     // if (ENABLE_DEBUG_CAPTURE)
     // {
@@ -248,7 +279,8 @@ static ChirpState dechirpState = {1.0f, 0.0f, 1.0f, 0.0f};
  
 void buildReferenceChirp()
 {
-
+  // Reference chirp is loaded into searchBuf (linear, not circular) and
+  // refEnergy is computed from it.
   u_int32_t lineCount = 0;
   refEnergy = 0.0f;
 
@@ -266,8 +298,8 @@ void buildReferenceChirp()
     line.trim(); 
 
     if (line.length() > 0) {
-      mallocTest[lineCount] = line.toFloat(); // Handles 0.0 perfectly
-      refEnergy += mallocTest[lineCount] * mallocTest[lineCount];
+      searchBuf[lineCount] = line.toFloat(); // Handles 0.0 perfectly
+      refEnergy += searchBuf[lineCount] * searchBuf[lineCount];
       lineCount++;
     }
   }
@@ -275,7 +307,7 @@ void buildReferenceChirp()
   myFile.close();
   Serial.printf("Done! Loaded %d lines into the array.\n", lineCount);
   for(int i=0; i< 20; i++) {
-    Serial.printf("Last value: %.8f\n", mallocTest[i]); 
+    Serial.printf("Last value: %.8f\n", searchBuf[i]); 
   }
  
 }
@@ -299,7 +331,9 @@ void setSearchBufferMode(BufferMode mode)
 }
 
  
-
+// Correlates the live left-channel rx ring (leftBuf), starting at searchHead,
+// against the fixed reference chirp (searchBuf). rightBuf (when enabled) is
+// not used in the correlation yet.
 float roughSearchForChirpStart()
 {
     float acc = 0.0f;
@@ -308,9 +342,10 @@ float roughSearchForChirpStart()
     for (uint32_t n = 0; n < CHIRP_SAMPLES; n++)
     {
         uint32_t idx = (searchHead + n) % CHIRP_SAMPLES;
-        float rx = searchBuf[idx];
-        acc += rx * mallocTest[n];
+        float rx = leftBuf[idx];      // left-channel rx ring
+        float ref = searchBuf[n];     // reference chirp (linear)
 
+        acc += rx * ref;
         rxEnergy += rx * rx;
     }
     float denom = sqrtf(rxEnergy * refEnergy) + EPS;
@@ -352,6 +387,10 @@ void setup()
  
 
     queue1.begin();
+    if (rightBufEnable)
+    {
+        queue2.begin();
+    }
  
     if (SD.exists("afsk_log.txt")) {
         SD.remove("afsk_log.txt");
@@ -362,23 +401,37 @@ void setup()
     else { Serial.println("Failed to open afsk_log.txt"); }
 
 
-    mallocTest = static_cast<float *>(malloc(MALLOC_TEST_SIZE));
-    if (mallocTest != nullptr)
+    // --- leftBuf: always allocated ---
+    leftBuf = static_cast<float *>(malloc(CHANNEL_BUF_SIZE));
+    if (leftBuf != nullptr)
     {
-        memset(mallocTest, 0, MALLOC_TEST_SIZE);
-        // for (uint32_t n = 0; n < CHIRP_SAMPLES; n++) {
-        //     mallocTest[n] = 1.0f;
-        // } 
-        // mallocTest[0] = 1.0f;
-        // mallocTest[1] = 2.0f;
-        // mallocTest[2] = 3.0f;
-
-        Serial.print("mallocTest allocated and cleared: ");
-        Serial.println(MALLOC_TEST_SIZE);
+        memset(leftBuf, 0, CHANNEL_BUF_SIZE);
+        Serial.print("leftBuf allocated and cleared: ");
+        Serial.println(CHANNEL_BUF_SIZE);
     }
     else
     {
-        Serial.println("mallocTest allocation failed");
+        Serial.println("leftBuf allocation failed");
+    }
+
+    // --- rightBuf: only allocated when rightBufEnable is true ---
+    if (rightBufEnable)
+    {
+        rightBuf = static_cast<float *>(malloc(CHANNEL_BUF_SIZE));
+        if (rightBuf != nullptr)
+        {
+            memset(rightBuf, 0, CHANNEL_BUF_SIZE);
+            Serial.print("rightBuf allocated and cleared: ");
+            Serial.println(CHANNEL_BUF_SIZE);
+        }
+        else
+        {
+            Serial.println("rightBuf allocation failed");
+        }
+    }
+    else
+    {
+        Serial.println("rightBufEnable=false: skipping rightBuf allocation.");
     }
 
     buildReferenceChirp();
@@ -407,6 +460,7 @@ void logFilePrint(const char* message) {
 void loop()
 {
     static uint32_t fftWindowStart = 0;
+    static bool bufMissingWarned = false;
 
 
     if (!isDSP)
@@ -421,12 +475,42 @@ void loop()
 
         return;
     }
- 
-    while (queue1.available() > 0)
-    {
-        int16_t *p = queue1.readBuffer();
 
-        if (!p) break;
+    // Safety guard: if leftBuf failed to allocate, don't run the DSP path --
+    // this avoids dereferencing a null pointer deep inside the audio ISR
+    // servicing path (which is a classic silent-hang cause).
+    if (leftBuf == nullptr)
+    {
+        if (!bufMissingWarned)
+        {
+            Serial.println("leftBuf is null -- DSP path disabled. Check heap/allocation.");
+            bufMissingWarned = true;
+        }
+        if (digitalRead(MODE_BUTTON_PIN) == LOW)
+        {
+            enterMtpMode();
+            delay(500);
+        }
+        return;
+    }
+ 
+    while (queue1.available() > 0 && (!rightBufEnable || queue2.available() > 0))
+    {
+        int16_t *pL = queue1.readBuffer();
+        int16_t *pR = nullptr;
+
+        if (!pL) break;
+
+        if (rightBufEnable)
+        {
+            pR = queue2.readBuffer();
+            if (!pR)
+            {
+                // Avoid leaking the left buffer we already claimed.
+                queue1.freeBuffer();
+                break;
+            }
+        }
 
         //Serial.println("1 ");
 
@@ -439,10 +523,16 @@ void loop()
 
         for (uint32_t i = 0; i < AUDIO_BLOCK_SAMPLES; i++)
         {
-            float sample = (float)p[i] * (1.0f / 32768.0f);
+            float sampleL = (float)pL[i] * (1.0f / 32768.0f);
 
-            // Feed the rolling search buffer used for chirp start detection.
-            searchBuf[searchHead] = sample;
+            leftBuf[searchHead] = sampleL;
+
+            if (rightBufEnable && rightBuf != nullptr)
+            {
+                float sampleR = (float)pR[i] * (1.0f / 32768.0f);
+                rightBuf[searchHead] = sampleR;
+            }
+
             searchHead = (searchHead + 1) % CHIRP_SAMPLES;
 
             totalSamples++;
@@ -494,19 +584,27 @@ void loop()
                 snprintf(logBuf, sizeof(logBuf), "SEARCHING -> DECHIRPING roughCorr %7.4f", maxCorr); 
 //                logFilePrint(logBuf);
 
-                // dumpSearchBuf();
+                // Dump the rx signal (left channel ring, leftBuf) in time order.
                 for (uint32_t n = 0; n < CHIRP_SAMPLES; n++) {
                     uint32_t idx = (searchHead + n) % CHIRP_SAMPLES;
-                    float rx = searchBuf[idx];
+                    float rx = leftBuf[idx];
                     logFile.println(rx, 8);
                 }
-                    
+                
+                if (rightBufEnable) {
+                    for (uint32_t n = 0; n < CHIRP_SAMPLES; n++) {
+                        uint32_t idx = (searchHead + n) % CHIRP_SAMPLES;
+                        float rx = rightBuf[idx];
+                        logFile.println(rx, 8);
+                    }
+                }   
+
+
+                logFile.close();   
                 // logFile.println("==ref starts====");
 
                 // for (uint32_t n = 0; n < CHIRP_SAMPLES; n++) {
-                //     //uint32_t idx = (searchHead + n) % CHIRP_SAMPLES;
-                //     //float rx = searchBuf[idx];
-                //     logFile.println(mallocTest[n], 8);
+                //     logFile.println(searchBuf[n], 8);
                 // } 
 
                 // logFile.println("==ref ends====");
@@ -529,7 +627,7 @@ void loop()
                 Serial.println();
 
                 digitalWrite(STATUS_1_PIN, HIGH); 
-                delay(1000*10);
+                delay(1000);
 
  
             }
@@ -537,6 +635,10 @@ void loop()
         //Serial.print("2.3 ");
  
         queue1.freeBuffer();
+        if (rightBufEnable)
+        {
+            queue2.freeBuffer();
+        }
     }
 
     //Serial.print("3 ");
