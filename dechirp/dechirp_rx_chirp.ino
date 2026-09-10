@@ -95,6 +95,28 @@ static constexpr float DETECT_RATIO_THRESHOLD = 8.0f;
 static constexpr float ROUGH_SEARCH_THRESHOLD = 0.03f;
 static constexpr float EPS = 1e-12f;
 
+// ------------------------------------------------------------
+// Sub-block ("stepped") correlation search.
+//
+// Instead of running one correlation per 128-sample audio block, the incoming
+// block is fed into the ring buffer N samples at a time, and a correlation is
+// computed after every N samples. This produces AUDIO_BLOCK_SAMPLES / N
+// correlations per audio block, each one N samples apart in time.
+//
+// SEARCH_STEP_N must be one of: 16, 32, 64, 128, and must evenly divide
+// AUDIO_BLOCK_SAMPLES (128 on Teensy Audio library).
+// ------------------------------------------------------------
+static constexpr uint32_t SEARCH_STEP_N = 64u;
+
+static_assert(SEARCH_STEP_N == 16 || SEARCH_STEP_N == 32 ||
+              SEARCH_STEP_N == 64 || SEARCH_STEP_N == 128,
+              "SEARCH_STEP_N must be 16, 32, 64, or 128");
+static_assert(AUDIO_BLOCK_SAMPLES % SEARCH_STEP_N == 0,
+              "SEARCH_STEP_N must evenly divide AUDIO_BLOCK_SAMPLES");
+
+// Number of correlations computed per incoming audio block.
+static constexpr uint32_t STEPS_PER_BLOCK = AUDIO_BLOCK_SAMPLES / SEARCH_STEP_N;
+
 // Streamed FFT-magnitude debug capture.
 // Each 4096-sample block is written immediately to the SD card to avoid large RAM usage.
 static constexpr bool ENABLE_DEBUG_CAPTURE = true;
@@ -106,7 +128,7 @@ static constexpr uint8_t MODE_BUTTON_PIN = 0;
 static constexpr uint8_t STATUS_1_PIN = 1;
 
 // do not forget to *sizeof(type) -- otherwise strange things will happen
-static constexpr size_t MALLOC_TEST_SIZE = CHIRP_SAMPLES*sizeof(float); 
+static constexpr size_t MALLOC_TEST_SIZE = CHIRP_SAMPLES*sizeof(float)*2; 
 bool isDSP = true;
 float *mallocTest = nullptr;
     
@@ -408,6 +430,13 @@ void loop()
 
         //Serial.println("1 ");
 
+        // Correlations computed for this audio block. At most STEPS_PER_BLOCK
+        // (AUDIO_BLOCK_SAMPLES / SEARCH_STEP_N) of these will be filled in;
+        // fewer will be filled while totalSamples is still ramping up to
+        // CHIRP_SAMPLES for the very first block(s).
+        float corrResults[STEPS_PER_BLOCK];
+        uint32_t corrCount = 0;
+
         for (uint32_t i = 0; i < AUDIO_BLOCK_SAMPLES; i++)
         {
             float sample = (float)p[i] * (1.0f / 32768.0f);
@@ -417,29 +446,52 @@ void loop()
             searchHead = (searchHead + 1) % CHIRP_SAMPLES;
 
             totalSamples++;
- 
-        }
- 
-        if (!chirpStartFound && totalSamples >= CHIRP_SAMPLES)
-        {
-            //Serial.print("2.1");
-            machineState = STATE_SEARCHING;
- 
-            float roughCorr = roughSearchForChirpStart();
- 
-            searchIterations++;
-            //Serial.print("2.2-"); 
-            if(roughCorr > 0.001) 
-                Serial.println(roughCorr, 6);
- 
-            //Serial.print("2.3 ");
 
-            if (roughCorr > ROUGH_SEARCH_THRESHOLD)
+            // Every SEARCH_STEP_N samples fed into the ring, run one
+            // correlation. This gives AUDIO_BLOCK_SAMPLES / SEARCH_STEP_N
+            // correlations per incoming audio block, spaced SEARCH_STEP_N
+            // samples apart.
+            if (!chirpStartFound && totalSamples >= CHIRP_SAMPLES && ((i + 1) % SEARCH_STEP_N == 0))
+            {
+                machineState = STATE_SEARCHING;
+
+                float roughCorr = roughSearchForChirpStart();
+                searchIterations++;
+
+                if (corrCount < STEPS_PER_BLOCK)
+                {
+                    corrResults[corrCount++] = roughCorr;
+                }
+            }
+        }
+
+        if (!chirpStartFound && corrCount > 0)
+        {
+            // Print all of this block's correlations on a single line.
+            float maxCorr = corrResults[0];
+            // Serial.print("corr[N=");
+            // Serial.print(SEARCH_STEP_N);
+            // Serial.print(", cnt=");
+            // Serial.print(corrCount);
+            // Serial.print("]: ");
+            for (uint32_t k = 0; k < corrCount; k++)
+            {
+                // Serial.print(corrResults[k], 6);
+                // Serial.print(' ');
+                if (corrResults[k] > maxCorr)
+                {
+                    maxCorr = corrResults[k];
+                }
+            }
+            // Serial.print(" max=");
+            // Serial.println(maxCorr, 6);
+
+            if (maxCorr > ROUGH_SEARCH_THRESHOLD)
             {
 
               bool dumpLog = true; 
               if(dumpLog) {
-                snprintf(logBuf, sizeof(logBuf), "SEARCHING -> DECHIRPING roughCorr %7.4f", roughCorr); 
+                snprintf(logBuf, sizeof(logBuf), "SEARCHING -> DECHIRPING roughCorr %7.4f", maxCorr); 
 //                logFilePrint(logBuf);
 
                 // dumpSearchBuf();
@@ -473,10 +525,11 @@ void loop()
                 Serial.print(" searchIters=");
                 Serial.print(searchIterations);
                 Serial.print(" corr=");
-                Serial.print(roughCorr, 4);
+                Serial.print(maxCorr, 4);
                 Serial.println();
 
                 digitalWrite(STATUS_1_PIN, HIGH); 
+                delay(1000*10);
 
  
             }
