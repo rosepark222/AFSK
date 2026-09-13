@@ -477,7 +477,7 @@ void processChirpDetection(float roughCorr)
             leftDumpFile.println(leftBuf[idx], 8);
         }
         leftDumpFile.close();
-        Serial.println("left_chirp_dump.txt written");
+        //Serial.println("left_chirp_dump.txt written");
     }
     else
     {
@@ -497,7 +497,7 @@ void processChirpDetection(float roughCorr)
                 rightDumpFile.println(rightBuf[idx], 8);
             }
             rightDumpFile.close();
-            Serial.println("right_chirp_dump.txt written");
+            //Serial.println("right_chirp_dump.txt written");
         }
         else
         {
@@ -568,7 +568,7 @@ void processChirpDetection(float roughCorr)
             crossCorrFile.println(crossCorr[k], 8);
         }
         crossCorrFile.close();
-        Serial.println("cross_corr_dump.txt written");
+        //Serial.println("cross_corr_dump.txt written");
     }
     else
     {
@@ -599,8 +599,47 @@ void processChirpDetection(float roughCorr)
         logFile.close();
     }
 
-    delay(1000);
-}
+
+
+
+
+
+
+
+  // 3. CRITICAL: Reset your sliding ring buffer parameters
+    chirpStartFound = false; 
+    searchHead = 0; 
+    g_leftMeanForXcorr = 0.0f;
+    // Clear out your running O(1) sum variable back to 0.0f here!
+    g_leftBufSum = 0.0f; 
+//   memset(leftBuf, 0, CHANNEL_BUF_SIZE); // Wipe historical audio clean
+//   if (rightBufEnable && rightBuf != nullptr) {
+//     memset(rightBuf, 0, CHANNEL_BUF_SIZE);
+//   }
+
+//   // 4. Start fresh for the second chirp
+//   queue1.begin(); 
+//   if (rightBufEnable) queue2.begin();
+  
+    // this should allow to capture the next chirp
+    //chirpStartFound = false;  
+    // searchHead = 0;
+    queue1.freeBuffer();
+    memset(leftBuf, 0, CHANNEL_BUF_SIZE);
+    if (rightBufEnable)
+    {
+        queue2.freeBuffer();
+        memset(rightBuf, 0, CHANNEL_BUF_SIZE);
+    }
+
+    queue1.begin();
+    if (rightBufEnable)
+    {
+        queue2.begin();
+    }
+    //delay(1000);
+    
+} // processChirpDetection
 
 // ============================================================
 // Setup
@@ -825,18 +864,21 @@ void loop()
             if (maxCorr > ROUGH_SEARCH_THRESHOLD)
             {
                 processChirpDetection(maxCorr);
+                break;
             }
         }
-        //Serial.print("2.3 ");
+        // Serial.print(" 2.3 ");
  
         queue1.freeBuffer();
         if (rightBufEnable)
         {
             queue2.freeBuffer();
         }
-    }
+    } //while (queue1.available() > 0 && (!rightBufEnable || queue2.available() > 0))
 
-    //Serial.print("3 ");
+
+    // Serial.print(" 2.4 ");
+
 
 
     if (digitalRead(MODE_BUTTON_PIN) == LOW)
