@@ -92,7 +92,7 @@ static constexpr uint32_t BLOCKS_PER_CHIRP = (CHIRP_SAMPLES + FFT_N - 1) / FFT_N
 
 // Detection threshold
 static constexpr float DETECT_RATIO_THRESHOLD = 8.0f;
-static constexpr float ROUGH_SEARCH_THRESHOLD = 0.03f;
+static constexpr float ROUGH_SEARCH_THRESHOLD = 0.1f; // 0.03 was used when DC offset inflated energy and deflated correlation 
 static constexpr float EPS = 1e-12f;
 
 // ------------------------------------------------------------
@@ -128,6 +128,14 @@ static constexpr uint8_t MODE_BUTTON_PIN = 0;
 static constexpr uint8_t STATUS_1_PIN = 1;
 
 // ------------------------------------------------------------
+// Fine cross-correlation (reference chirp vs. left channel) done once a
+// rough chirp start has been detected. Lag range is +/- FINE_XCORR_MAX_LAG
+// samples, giving 2*FINE_XCORR_MAX_LAG + 1 lag points.
+// ------------------------------------------------------------
+static constexpr int32_t FINE_XCORR_MAX_LAG = 100;
+static constexpr uint32_t FINE_XCORR_NUM_LAGS = 2u * (uint32_t)FINE_XCORR_MAX_LAG + 1u;
+
+// ------------------------------------------------------------
 // Runtime switch: set to false to disable ALL right-channel (queue2) work --
 // no queue2.begin()/.end(), no rightBuf allocation, no rightBuf writes, no
 // queue2.readBuffer()/.freeBuffer(). With this false the sketch behaves as a
@@ -150,6 +158,35 @@ float *leftBuf = nullptr;   // left-channel  rx ring, always allocated
 float *rightBuf = nullptr;  // right-channel rx ring, allocated only if rightBufEnable
     
 
+static bool debug_leftBuf_eq_searchBuf = false; // debuf for leftBuf is equal to refBuf
+
+// ------------------------------------------------------------
+// DC-offset removal for the fine cross-correlation.
+//
+// A DC bias in leftBuf adds a constant term into both the energy sum and
+// every lag's correlation sum, which inflates the energy (denominator) and
+// deflates/blurs the true correlation peak. g_leftMeanForXcorr holds the
+// mean of whichever signal leftLinearZeroPad() is currently reading (either
+// leftBuf, or searchBuf when debug_leftBuf_eq_searchBuf is true), computed
+// once per detection event in processChirpDetection(), and is subtracted
+// from every sample leftLinearZeroPad() returns (real samples only -- the
+// zero-padded region outside [0, CHIRP_SAMPLES) stays exactly 0, since
+// there's no captured signal there to de-bias).
+// ------------------------------------------------------------
+static float g_leftMeanForXcorr = 0.0f;
+
+// ------------------------------------------------------------
+// Running (exact) sum of every sample currently sitting in leftBuf.
+// Maintained incrementally, O(1) per sample, by subtracting the value about
+// to be evicted from a ring slot and adding the new value in loop() -- see
+// the write into leftBuf[searchHead] below. Since leftBuf is always exactly
+// CHIRP_SAMPLES long, g_leftBufSum / CHIRP_SAMPLES is always the exact
+// current DC mean of the whole ring, with no extra full-buffer pass needed.
+// Used by roughSearchForChirpStart() to remove DC bias cheaply on every
+// call. Declared as double so the running sum doesn't drift over long
+// uptimes from repeated float add/subtract.
+// ------------------------------------------------------------
+static double g_leftBufSum = 0.0;
 
 // ============================================================
 // Audio Objects
@@ -339,11 +376,15 @@ float roughSearchForChirpStart()
     float acc = 0.0f;
     float rxEnergy = 0.0f;
 
+    // Exact current DC mean of leftBuf, from the incrementally-maintained
+    // running sum -- O(1), no extra pass over the buffer needed.
+    float leftMean = (float)(g_leftBufSum / (double)CHIRP_SAMPLES);
+
     for (uint32_t n = 0; n < CHIRP_SAMPLES; n++)
     {
         uint32_t idx = (searchHead + n) % CHIRP_SAMPLES;
-        float rx = leftBuf[idx];      // left-channel rx ring
-        float ref = searchBuf[n];     // reference chirp (linear)
+        float rx = leftBuf[idx] - leftMean;   // left-channel rx ring, DC-removed
+        float ref = searchBuf[n];             // reference chirp (linear)
 
         acc += rx * ref;
         rxEnergy += rx * rx;
@@ -351,7 +392,216 @@ float roughSearchForChirpStart()
     float denom = sqrtf(rxEnergy * refEnergy) + EPS;
     return fabsf(acc) / denom;
 }
+
+// Reads leftBuf as if it were a plain LINEAR array of length CHIRP_SAMPLES,
+// time-ordered starting at searchHead (same de-rotation used everywhere else
+// in this file). Any index outside [0, CHIRP_SAMPLES) returns 0.0f instead
+// of wrapping -- this is what makes the fine cross-correlation a proper
+// zero-padded (non-circular) correlation instead of a circular one.
+//
+// DC removal: real samples (in-range) have g_leftMeanForXcorr subtracted
+// before being returned. Out-of-range (zero-padded) samples stay exactly
+// 0.0f -- there's no captured signal there, so there's nothing to de-bias.
+static inline float leftLinearZeroPad(int32_t offset_from_searchHead)
+{
+    if (offset_from_searchHead < 0 || offset_from_searchHead >= (int32_t)CHIRP_SAMPLES)
+    {
+        return 0.0f;
+    }
  
+    if(debug_leftBuf_eq_searchBuf) {
+        uint32_t idx = (uint32_t)offset_from_searchHead % CHIRP_SAMPLES;
+        return searchBuf[idx] - g_leftMeanForXcorr;
+    } else {
+        uint32_t idx = (searchHead + (uint32_t)offset_from_searchHead) % CHIRP_SAMPLES;
+        return leftBuf[idx] - g_leftMeanForXcorr;
+    }
+
+}
+
+// ============================================================
+// Post-detection processing: dumps + fine cross-correlation
+// ============================================================
+//
+// Called once when the rough search declares a chirp start. Handles:
+//   0. stopping both audio queues (no more mic listening)
+//   1. dumping leftBuf  -> left_chirp_dump.txt
+//   2. dumping rightBuf -> right_chirp_dump.txt (if enabled)
+//   3. fine cross-correlation: REFERENCE CHIRP (searchBuf) vs. leftBuf,
+//      lag -FINE_XCORR_MAX_LAG..+FINE_XCORR_MAX_LAG, energy-normalized,
+//      with the DC offset of leftBuf removed first
+//   5. dumping the crossCorr array -> cross_corr_dump.txt
+//   6. printing the peak correlation value and its lag to Serial
+//   7. closing all files
+//
+// Normalization note: because leftBuf is a full CHIRP_SAMPLES-length
+// circular ring, the sum of squares over the whole ring is the same
+// regardless of which sample we call "start" (a circular shift doesn't
+// change total energy). So the local "left energy" term is just the total
+// (mean-removed) leftBuf energy, computed once, and reused for every lag --
+// no need to recompute a windowed energy per lag.
+// ------------------------------------------------------------
+void processChirpDetection(float roughCorr)
+{
+    // ---- 0. stop listening to both mic channels ----
+    queue1.end();
+    if (rightBufEnable)
+    {
+        queue2.end();
+    }
+
+    chirpStartSample = totalSamples - CHIRP_SAMPLES;
+    chirpStartFound = true;
+    machineState = STATE_DECHIRPING;
+
+    setSearchBufferMode(BUFFER_DECHIRP);
+
+    Serial.print("[STATE=TRANSITION] SEARCHING -> DECHIRPING sample=");
+    Serial.print(chirpStartSample);
+    Serial.print(" searchIters=");
+    Serial.print(searchIterations);
+    Serial.print(" corr=");
+    Serial.print(roughCorr, 4);
+    Serial.println();
+
+    digitalWrite(STATUS_1_PIN, HIGH);
+
+    // ---- 1. dump left channel (time-ordered) ----
+    if (SD.exists("left_chirp_dump.txt")) SD.remove("left_chirp_dump.txt");
+    File leftDumpFile = SD.open("left_chirp_dump.txt", FILE_WRITE);
+    if (leftDumpFile)
+    {
+        for (uint32_t n = 0; n < CHIRP_SAMPLES; n++)
+        {
+            uint32_t idx = (searchHead + n) % CHIRP_SAMPLES;
+            leftDumpFile.println(leftBuf[idx], 8);
+        }
+        leftDumpFile.close();
+        Serial.println("left_chirp_dump.txt written");
+    }
+    else
+    {
+        Serial.println("Failed to open left_chirp_dump.txt");
+    }
+
+    // ---- 2. dump right channel (time-ordered) ----
+    if (rightBufEnable && rightBuf != nullptr)
+    {
+        if (SD.exists("right_chirp_dump.txt")) SD.remove("right_chirp_dump.txt");
+        File rightDumpFile = SD.open("right_chirp_dump.txt", FILE_WRITE);
+        if (rightDumpFile)
+        {
+            for (uint32_t n = 0; n < CHIRP_SAMPLES; n++)
+            {
+                uint32_t idx = (searchHead + n) % CHIRP_SAMPLES;
+                rightDumpFile.println(rightBuf[idx], 8);
+            }
+            rightDumpFile.close();
+            Serial.println("right_chirp_dump.txt written");
+        }
+        else
+        {
+            Serial.println("Failed to open right_chirp_dump.txt");
+        }
+    }
+
+    // ---- 3a. compute DC mean of whichever signal leftLinearZeroPad() reads ----
+    // (leftBuf normally, or searchBuf when debug_leftBuf_eq_searchBuf is true)
+    float leftMean = 0.0f;
+    for (uint32_t n = 0; n < CHIRP_SAMPLES; n++)
+    {
+        float v = debug_leftBuf_eq_searchBuf ? searchBuf[n] : leftBuf[n];
+        leftMean += v;
+    }
+    leftMean /= (float)CHIRP_SAMPLES;
+    g_leftMeanForXcorr = leftMean;  // used by leftLinearZeroPad() below
+
+    // ---- 3b. fine cross-correlation: reference chirp vs. leftBuf ----
+    // total left energy (DC removed), used as the (constant across lags)
+    // normalization term
+    float leftEnergyTotal = 0.0f;
+    for (uint32_t n = 0; n < CHIRP_SAMPLES; n++)
+    {
+        float raw = debug_leftBuf_eq_searchBuf ? searchBuf[n] : leftBuf[n];
+        float v = raw - leftMean;
+        leftEnergyTotal += v * v;
+    }
+    float xcorrDenom = sqrtf(leftEnergyTotal * refEnergy) + EPS;
+
+    static float crossCorr[FINE_XCORR_NUM_LAGS];
+
+    for (int32_t lag = -FINE_XCORR_MAX_LAG; lag <= FINE_XCORR_MAX_LAG; lag++)
+    {
+        float acc = 0.0f;
+        for (uint32_t n = 0; n < CHIRP_SAMPLES; n++)
+        {
+ 
+            // Q: I need to define the direction of lag. Let's say reference chirp is 4 byte length of abcd and 
+            // leftBuf is ABCD, lag=0, means  corr (abcd, ABCD). 
+            // If lag=-1, then does it mean corr(abcd, BCD0) or corr(abcd, 0ABC)?
+
+            // Ans: lag = -1 gives  corr(abcd, BCD0) -- leftBuf is advanced
+            // lag < 0 means leftBuf is advanced (arrived early).
+            acc += searchBuf[n] * leftLinearZeroPad((int32_t)n - lag);
+        }
+        crossCorr[lag + FINE_XCORR_MAX_LAG] = acc / xcorrDenom;
+
+        if(lag == -FINE_XCORR_MAX_LAG) {
+            Serial.print(" leftMean : "); Serial.print(leftMean, 8);
+            Serial.print(" leftEnergyTotal : "); Serial.print(leftEnergyTotal);
+            Serial.print(" refEnergy : "); Serial.print(refEnergy);
+            Serial.print(" lag: "); Serial.print(leftEnergyTotal * refEnergy);
+            Serial.println("");
+        }
+    }
+
+    // ---- 5. dump crossCorr array ----
+    if (SD.exists("cross_corr_dump.txt")) SD.remove("cross_corr_dump.txt");
+    File crossCorrFile = SD.open("cross_corr_dump.txt", FILE_WRITE);
+    if (crossCorrFile)
+    {
+        for (uint32_t k = 0; k < FINE_XCORR_NUM_LAGS; k++)
+        {
+            int32_t lag = (int32_t)k - FINE_XCORR_MAX_LAG;
+            crossCorrFile.print(lag);
+            crossCorrFile.print(", ");
+            crossCorrFile.println(crossCorr[k], 8);
+        }
+        crossCorrFile.close();
+        Serial.println("cross_corr_dump.txt written");
+    }
+    else
+    {
+        Serial.println("Failed to open cross_corr_dump.txt");
+    }
+
+    // ---- 6. find peak (normalized) correlation and its lag ----
+    uint32_t maxIdx = 0;
+    float maxVal = crossCorr[0];
+    for (uint32_t k = 1; k < FINE_XCORR_NUM_LAGS; k++)
+    {
+        if (crossCorr[k] > maxVal)
+        {
+            maxVal = crossCorr[k];
+            maxIdx = k;
+        }
+    }
+    int32_t bestLag = (int32_t)maxIdx - FINE_XCORR_MAX_LAG;
+
+    Serial.print("[XCORR ref-vs-left] max=");
+    Serial.print(maxVal, 6);
+    Serial.print(" at lag=");
+    Serial.println(bestLag);
+
+    // ---- 7. close remaining open files ----
+    if (logFile)
+    {
+        logFile.close();
+    }
+
+    delay(1000);
+}
+
 // ============================================================
 // Setup
 // ============================================================
@@ -525,7 +775,12 @@ void loop()
         {
             float sampleL = (float)pL[i] * (1.0f / 32768.0f);
 
+            // Keep g_leftBufSum exactly equal to the sum of everything
+            // currently in leftBuf: remove the sample about to be evicted
+            // from this ring slot, then add the new one. O(1) per sample.
+            g_leftBufSum -= (double)leftBuf[searchHead];
             leftBuf[searchHead] = sampleL;
+            g_leftBufSum += (double)sampleL;
 
             if (rightBufEnable && rightBuf != nullptr)
             {
@@ -559,77 +814,17 @@ void loop()
         {
             // Print all of this block's correlations on a single line.
             float maxCorr = corrResults[0];
-            // Serial.print("corr[N=");
-            // Serial.print(SEARCH_STEP_N);
-            // Serial.print(", cnt=");
-            // Serial.print(corrCount);
-            // Serial.print("]: ");
             for (uint32_t k = 0; k < corrCount; k++)
             {
-                // Serial.print(corrResults[k], 6);
-                // Serial.print(' ');
                 if (corrResults[k] > maxCorr)
                 {
                     maxCorr = corrResults[k];
                 }
             }
-            // Serial.print(" max=");
-            // Serial.println(maxCorr, 6);
 
             if (maxCorr > ROUGH_SEARCH_THRESHOLD)
             {
-
-              bool dumpLog = true; 
-              if(dumpLog) {
-                snprintf(logBuf, sizeof(logBuf), "SEARCHING -> DECHIRPING roughCorr %7.4f", maxCorr); 
-//                logFilePrint(logBuf);
-
-                // Dump the rx signal (left channel ring, leftBuf) in time order.
-                for (uint32_t n = 0; n < CHIRP_SAMPLES; n++) {
-                    uint32_t idx = (searchHead + n) % CHIRP_SAMPLES;
-                    float rx = leftBuf[idx];
-                    logFile.println(rx, 8);
-                }
-                
-                if (rightBufEnable) {
-                    for (uint32_t n = 0; n < CHIRP_SAMPLES; n++) {
-                        uint32_t idx = (searchHead + n) % CHIRP_SAMPLES;
-                        float rx = rightBuf[idx];
-                        logFile.println(rx, 8);
-                    }
-                }   
-
-
-                logFile.close();   
-                // logFile.println("==ref starts====");
-
-                // for (uint32_t n = 0; n < CHIRP_SAMPLES; n++) {
-                //     logFile.println(searchBuf[n], 8);
-                // } 
-
-                // logFile.println("==ref ends====");
-              }
-
-                chirpStartSample = totalSamples - CHIRP_SAMPLES;
-                chirpStartFound = true;
-                machineState = STATE_DECHIRPING;
-
-                setSearchBufferMode(BUFFER_DECHIRP);
-                // fftWindowStart = chirpStartSample;
-                // initChirpStateFromOffset(dechirpState, 0u);
-
-                Serial.print("[STATE=TRANSITION] SEARCHING -> DECHIRPING sample=");
-                Serial.print(chirpStartSample);
-                Serial.print(" searchIters=");
-                Serial.print(searchIterations);
-                Serial.print(" corr=");
-                Serial.print(maxCorr, 4);
-                Serial.println();
-
-                digitalWrite(STATUS_1_PIN, HIGH); 
-                delay(1000);
-
- 
+                processChirpDetection(maxCorr);
             }
         }
         //Serial.print("2.3 ");
