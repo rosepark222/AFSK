@@ -188,6 +188,17 @@ static float g_leftMeanForXcorr = 0.0f;
 // ------------------------------------------------------------
 static double g_leftBufSum = 0.0;
 
+// ------------------------------------------------------------
+// Per-detection-event identifier, used to build unique dump filenames and to
+// tag the Serial "[XCORR ref-vs-left]" line so a printed maxVal/lag can be
+// matched back to the exact left/right/cross-corr dump files that produced
+// it. Combines a wall-clock timestamp (from TimeLib, if the RTC/time has
+// been set) with a monotonically increasing counter, so filenames stay
+// unique even if the clock hasn't been set (all zeros/epoch) or two
+// detections land in the same second.
+// ------------------------------------------------------------
+static uint32_t g_detectionCounter = 0;
+
 // ============================================================
 // Audio Objects
 // ============================================================
@@ -321,7 +332,7 @@ void buildReferenceChirp()
   u_int32_t lineCount = 0;
   refEnergy = 0.0f;
 
-  File myFile = SD.open("ref_chirp.txt", FILE_READ);
+  File myFile = SD.open("A/ref_chirp.txt", FILE_READ);
   if (!myFile) {
     Serial.println("Error opening file!");
     return;
@@ -425,14 +436,22 @@ static inline float leftLinearZeroPad(int32_t offset_from_searchHead)
 //
 // Called once when the rough search declares a chirp start. Handles:
 //   0. stopping both audio queues (no more mic listening)
-//   1. dumping leftBuf  -> left_chirp_dump.txt
-//   2. dumping rightBuf -> right_chirp_dump.txt (if enabled)
+//   1. dumping leftBuf  -> left_<tag>.txt
+//   2. dumping rightBuf -> right_<tag>.txt (if enabled)
 //   3. fine cross-correlation: REFERENCE CHIRP (searchBuf) vs. leftBuf,
 //      lag -FINE_XCORR_MAX_LAG..+FINE_XCORR_MAX_LAG, energy-normalized,
 //      with the DC offset of leftBuf removed first
-//   5. dumping the crossCorr array -> cross_corr_dump.txt
-//   6. printing the peak correlation value and its lag to Serial
+//   5. dumping the crossCorr array -> xcorr_<tag>.txt
+//   6. printing the peak correlation value and its lag to Serial, tagged
+//      with the same <tag> used for the dump filenames
 //   7. closing all files
+//
+// <tag> is built once per call from the current wall-clock time (TimeLib)
+// plus a monotonically increasing detection counter (g_detectionCounter),
+// so every detection event gets its own set of left/right/xcorr dump files
+// instead of overwriting the previous event's files, and the Serial line
+// printed for that event's peak correlation can always be matched back to
+// the exact files that produced it.
 //
 // Normalization note: because leftBuf is a full CHIRP_SAMPLES-length
 // circular ring, the sum of squares over the whole ring is the same
@@ -456,19 +475,37 @@ void processChirpDetection(float roughCorr)
 
     setSearchBufferMode(BUFFER_DECHIRP);
 
+
+    g_detectionCounter++;
+    char eventTag[40];
+    snprintf(eventTag, sizeof(eventTag), "%010lu_%02d%02d%02d_%03lu",
+             (unsigned long)micros(),
+             hour(), minute(), second(),
+             (unsigned long)g_detectionCounter);
+
+    char leftDumpName[64];
+    char rightDumpName[64];
+    char crossCorrName[64];
+    snprintf(leftDumpName, sizeof(leftDumpName), "A/zleft_%s.txt", eventTag);
+    snprintf(rightDumpName, sizeof(rightDumpName), "A/zright_%s.txt", eventTag);
+    snprintf(crossCorrName, sizeof(crossCorrName), "A/zxcorr_%s.txt", eventTag);
+
     Serial.print("[STATE=TRANSITION] SEARCHING -> DECHIRPING sample=");
     Serial.print(chirpStartSample);
     Serial.print(" searchIters=");
     Serial.print(searchIterations);
     Serial.print(" corr=");
     Serial.print(roughCorr, 4);
+    Serial.print(" tag=");
+    Serial.print(eventTag);
     Serial.println();
 
     digitalWrite(STATUS_1_PIN, HIGH);
 
     // ---- 1. dump left channel (time-ordered) ----
-    if (SD.exists("left_chirp_dump.txt")) SD.remove("left_chirp_dump.txt");
-    File leftDumpFile = SD.open("left_chirp_dump.txt", FILE_WRITE);
+    // No SD.exists()/SD.remove() needed any more -- eventTag makes this
+    // filename unique per detection, so nothing is ever overwritten.
+    File leftDumpFile = SD.open(leftDumpName, FILE_WRITE);
     if (leftDumpFile)
     {
         for (uint32_t n = 0; n < CHIRP_SAMPLES; n++)
@@ -477,18 +514,19 @@ void processChirpDetection(float roughCorr)
             leftDumpFile.println(leftBuf[idx], 8);
         }
         leftDumpFile.close();
-        //Serial.println("left_chirp_dump.txt written");
+        // Serial.print(leftDumpName);
+        // Serial.println(" written");
     }
     else
     {
-        Serial.println("Failed to open left_chirp_dump.txt");
+        Serial.print("Failed to open ");
+        Serial.println(leftDumpName);
     }
 
     // ---- 2. dump right channel (time-ordered) ----
     if (rightBufEnable && rightBuf != nullptr)
     {
-        if (SD.exists("right_chirp_dump.txt")) SD.remove("right_chirp_dump.txt");
-        File rightDumpFile = SD.open("right_chirp_dump.txt", FILE_WRITE);
+        File rightDumpFile = SD.open(rightDumpName, FILE_WRITE);
         if (rightDumpFile)
         {
             for (uint32_t n = 0; n < CHIRP_SAMPLES; n++)
@@ -497,11 +535,13 @@ void processChirpDetection(float roughCorr)
                 rightDumpFile.println(rightBuf[idx], 8);
             }
             rightDumpFile.close();
-            //Serial.println("right_chirp_dump.txt written");
+            // Serial.print(rightDumpName);
+            // Serial.println(" written");
         }
         else
         {
-            Serial.println("Failed to open right_chirp_dump.txt");
+            Serial.print("Failed to open ");
+            Serial.println(rightDumpName);
         }
     }
 
@@ -546,18 +586,26 @@ void processChirpDetection(float roughCorr)
         }
         crossCorr[lag + FINE_XCORR_MAX_LAG] = acc / xcorrDenom;
 
-        if(lag == -FINE_XCORR_MAX_LAG) {
+        if(lag == 0) {
             Serial.print(" leftMean : "); Serial.print(leftMean, 8);
             Serial.print(" leftEnergyTotal : "); Serial.print(leftEnergyTotal);
             Serial.print(" refEnergy : "); Serial.print(refEnergy);
-            Serial.print(" lag: "); Serial.print(leftEnergyTotal * refEnergy);
+            Serial.print(" lag: 0");  
             Serial.println("");
+
+
+            logFile.print(eventTag);
+            logFile.print(" leftMean : "); logFile.print(leftMean, 8);
+            logFile.print(" leftEnergyTotal : "); logFile.print(leftEnergyTotal);
+            logFile.print(" refEnergy : "); logFile.print(refEnergy);
+            logFile.print(" lag: 0");  
+            logFile.println();
+ 
         }
     }
 
     // ---- 5. dump crossCorr array ----
-    if (SD.exists("cross_corr_dump.txt")) SD.remove("cross_corr_dump.txt");
-    File crossCorrFile = SD.open("cross_corr_dump.txt", FILE_WRITE);
+    File crossCorrFile = SD.open(crossCorrName, FILE_WRITE);
     if (crossCorrFile)
     {
         for (uint32_t k = 0; k < FINE_XCORR_NUM_LAGS; k++)
@@ -568,11 +616,13 @@ void processChirpDetection(float roughCorr)
             crossCorrFile.println(crossCorr[k], 8);
         }
         crossCorrFile.close();
-        //Serial.println("cross_corr_dump.txt written");
+        // Serial.print(crossCorrName);
+        // Serial.println(" written");
     }
     else
     {
-        Serial.println("Failed to open cross_corr_dump.txt");
+        Serial.print("Failed to open ");
+        Serial.println(crossCorrName);
     }
 
     // ---- 6. find peak (normalized) correlation and its lag ----
@@ -588,16 +638,20 @@ void processChirpDetection(float roughCorr)
     }
     int32_t bestLag = (int32_t)maxIdx - FINE_XCORR_MAX_LAG;
 
-    Serial.print("[XCORR ref-vs-left] max=");
+    // Tag included here so this printed line can always be matched back to
+    // left_<tag>.txt / right_<tag>.txt / xcorr_<tag>.txt on the SD card.
+    Serial.print("[XCORR ref-vs-left] tag=");
+    Serial.print(eventTag);
+    Serial.print(" max=");
     Serial.print(maxVal, 6);
     Serial.print(" at lag=");
     Serial.println(bestLag);
 
     // ---- 7. close remaining open files ----
-    if (logFile)
-    {
-        logFile.close();
-    }
+    // if (logFile)
+    // {
+    //     logFile.close();
+    // }
 
 
 
@@ -681,13 +735,13 @@ void setup()
         queue2.begin();
     }
  
-    if (SD.exists("afsk_log.txt")) {
-        SD.remove("afsk_log.txt");
+    if (SD.exists("chirp_log.txt")) {
+        SD.remove("chirp_log.txt");
     }
 
-    logFile = SD.open("afsk_log.txt", FILE_WRITE);
-    if (logFile) { Serial.println("afsk_log.txt opened"); }
-    else { Serial.println("Failed to open afsk_log.txt"); }
+    logFile = SD.open("A/chirp_log.txt", FILE_WRITE);
+    if (logFile) { Serial.println("chirp_log.txt opened"); }
+    else { Serial.println("Failed to open chirp_log.txt"); }
 
 
     // --- leftBuf: always allocated ---
