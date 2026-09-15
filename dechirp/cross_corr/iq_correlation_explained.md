@@ -229,3 +229,22 @@ right, sufficient answer — there is no carrier phase to average out.
   Q(τ), then take the magnitude `A(τ) = √(I² + Q²)` to get a carrier-phase
   independent envelope — the quantity that should actually be used to judge
   peak location, mainlobe width, and sidelobe levels.
+
+## 7. Teensy Implementation
+
+
+  If I want to do I and Q correlation in Teensy, do I have to store reference for I and Q separately and correlate them to get the amplitude A ? Currently, I only store real reference and do cross correlation to get the oscillating cross-correlation in Teensy.
+
+  Yes — on a microcontroller you need two reference arrays: refI[n] (your current real chirp reference) and refQ[n] (its 90°-shifted quadrature companion). You correlate the same incoming real signal against both, then combine to get the envelope. A few important details for doing this efficiently on Teensy:
+
+Don't compute the Hilbert transform at runtime. For a chirp you know analytically — s(t) = A(t)·cos(φ(t)) — its quadrature companion is just A(t)·sin(φ(t)), the same envelope with sine instead of cosine, using the same instantaneous phase law. You can generate both refI and refQ offline in Python (or MATLAB), then bake them into flash as two constant arrays. No runtime FFT/Hilbert transform needed on the Teensy at all — this avoids the finite-window edge artifacts I mentioned earlier, since you're generating the ideal quadrature signal directly rather than approximating it.
+You do double the multiply-accumulate work, not double the memory traffic. Since both correlations use the same incoming sample stream, a single pass through the received buffer can accumulate both I and Q sums together — you're not re-reading the input twice, just doing two MACs per sample instead of one. On a Teensy 4.x (Cortex-M7 with hardware FPU, running near 600 MHz), this is cheap for typical chirp lengths (tens to low hundreds of samples).
+
+Reference storage roughly doubles, but the reference is usually short (chirp duration in samples), so this is normally trivial — even a few thousand samples of float reference data is a small fraction of a Teensy 4.1's flash/RAM. 
+
+A few practical notes for your actual port:
+
+Generating refI/refQ: In Python, compute the chirp's phase law phi(t), then refI = A(t)*cos(phi(t)), refQ = A(t)*sin(phi(t)), and export both as C arrays (e.g. via numpy → text formatting, or a small script that writes a .h file with const float refI[] PROGMEM = {...};).
+Performance: If REF_LEN * MAX_LAG gets large (long chirps, long search windows), consider using the CMSIS-DSP library (arm_correlate_f32), which is well-optimized for Cortex-M7 — call it twice (once for I, once for Q) instead of hand-rolling the double loop, though the manual single-pass-over-input version above is often just as fast for a real-time embedded loop since it avoids extra buffer copies.
+Fixed-point option: if you need more headroom, both correlations can be done in int32_t/int16_t fixed-point using the DSP extensions of the Cortex-M7, but on Teensy 4.x the hardware FPU usually makes float simplest and plenty fast.
+Keep the peak/timing decision logic tied to A_out[] (the envelope), not the raw I_out[] — that's the direct replacement for what you were doing with the plain real correlation before.
