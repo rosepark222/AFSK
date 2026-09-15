@@ -53,8 +53,8 @@ def main():
     parser = argparse.ArgumentParser(description="Cross-correlate two signals from files.")
     parser.add_argument("fileA", help="Path to file containing signal A")
     parser.add_argument("fileB", help="Path to file containing signal B")
-    parser.add_argument("--fs", type=float, default=1.0,
-                         help="Sampling frequency (Hz) used to build time axes. Default 1.0 (samples).")
+    parser.add_argument("--fs", type=float, default=44100, help="Sampling frequency (Hz) used to build time axes. Default 44100 (samples).")
+    parser.add_argument("--xlim", type=float, default=4000, help="Sampling frequency (Hz) used to build time axes. Default 44100 (samples).")
     parser.add_argument("--no-normalize", action="store_true",
                          help="Disable normalization of the cross-correlation.")
     args = parser.parse_args()
@@ -94,19 +94,22 @@ def main():
     axes[2].plot(lags, C, color="tab:green")
 
     axes[2].axvline(best_lag, color="red", linestyle="--",
-                     label=f"Peak lag (+ means A lags B) = {best_lag} samples")
-    axes[2].set_xlim(best_lag - 200, best_lag + 200)
+                     label=f"Peak lag (+ means B has to be delayed to be aligned to A) = {best_lag} samples")
+    print(best_lag)
+    # axes[2].set_xlim(best_lag - 200, best_lag + 200)
+    axes[2].set_xlim(-args.xlim, args.xlim)
     axes[2].set_title("Cross-correlation (A ⋆ B)")
     axes[2].set_xlabel(f"Peak correlation = {C[best_lag_idx]:.4f} at lag = {best_lag} samples "
                         f"({best_lag / args.fs:.4f} s)")
+    axes[2].set_ylim(-1, 1)
     axes[2].set_ylabel("Correlation")
     axes[2].legend()
     axes[2].grid(True, alpha=0.3)
 
     plt.tight_layout()
-    out_path = "cross_correlation_result.png"
-    plt.savefig(out_path, dpi=150)
-    print(f"Plot saved to {out_path}")
+    #out_path = "cross_correlation_result.png"
+    #plt.savefig(out_path, dpi=150)
+    #print(f"Plot saved to {out_path}")
     plt.show()
 
 
