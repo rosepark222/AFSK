@@ -684,3 +684,159 @@ Peak-to-total-energy fraction: what fraction of total FFT energy sits in the pea
 
 Require that ratio to clear a second threshold before proceeding to Step 3, and you get something close to a two-stage CFAR-style detector: Step 1's rough correlation as a cheap gate, Step 2's spectral concentration as a corroborating, largely independent gate, and Step 3's fine correlation magnitude as a third confirmation. A stray sidelobe hit on pure noise would very likely fail the Step 2 peakiness check and get discarded before ever reaching the fine search — which is the actual mechanism protecting you, not the buffer padding.
 
+ 
+# Step 2 (Dechirp + FFT) vs. GCC-PHAT — Q&A
+
+## Question 1
+
+In this rx plan, I have a question on the step 2.
+
+```
+Real RX samples
+      │
+      ├── Step 1: Real correlation
+      │       └── Rough chirp-start estimate
+      │
+      ├── Step 2: Complex dechirp + FFT
+      │       └── Beat-frequency bin
+      │               └── Coarse delay estimate
+      │
+      └── Step 3: Analytic complex correlation
+              └── Sample-level delay refinement
+```
+
+The step 2 looks for the delay estimate. Here it takes advantage of LFM of the chirp. Since chirp has different freq component each sub freq shows linear phase between rx signal and the reference. Typically GCC-PHAT is used for two mics and one mic is the reference. We can assume the reference signal is from a virtual mic and rx signal from another mic and then use GCC-PHAT to get the delay between the two. The difference is that GCC-PHAT does not take advantage of the signal being a chirp cause it works for any signal as long as they are wideband enough. Can you give your thought and compare the step 2 vs GCC-PHAT -- pros and cons.
+
+## Answer
+
+Good question, and it gets at something real: both methods ultimately rely on the same physical fact (a time delay is a linear phase ramp across frequency), but they extract and weight that phase information very differently.
+
+### The common root
+
+For any two signals related by a pure delay τ, their cross-spectrum has the form:
+
+$$
+X_1(f)X_2^*(f) \propto |S(f)|^2 e^{-j2\pi f\tau}
+$$
+
+The phase slope across frequency *is* the delay. Every delay-estimation method — dechirp+FFT, GCC-PHAT, ordinary cross-correlation — is extracting that slope in some form. Where they diverge is what they assume about $S(f)$ and how they weight it.
+
+### What Step 2 actually exploits
+
+Step 2 doesn't use the phase-slope argument directly. It uses a property specific to LFM: because instantaneous frequency is a **linear function of time**, a delayed copy of the chirp has an instantaneous frequency offset from the reference that is *constant* in time — $f_b = K\tau$. Mixing collapses the whole delay-estimation problem into estimating one number (a beat tone) rather than a phase-vs-frequency slope. This is exactly radar "stretch processing" / "deramp" — trading a general correlation problem for a single-frequency estimation problem, because you know the waveform's exact time-frequency law.
+
+That's the crucial difference: **Step 2 needs to know the transmitted signal is a chirp with these exact parameters.** GCC-PHAT needs no such knowledge.
+
+### What GCC-PHAT does instead
+
+ 
+$$ 
+R_{\text{PHAT}}(\tau) = \text{IFFT} \frac{X_1(f)X_2^*(f)}{|X_1(f)X_2^*(f)|} 
+$$
+
+$$ 
+R_{\text{PHAT}}(\tau) 
+$$
+
+$$ 
+  \text{IFFT} 
+$$
+
+$$ 
+\frac {X_1(f)X_2^{*}(f)} {|X_1(f)X_2^{*}(f)|} 
+$$
+
+$$
+\frac{X_1(f)X_2^*(f)}{|X_1(f)X_2^*(f)|}
+$$
+
+$$ 
+\frac {1} {|X_1(f)X_2^*(f)|} 
+$$
+
+$$ 
+\frac {X_1(f)X_2^*(f)} {1} 
+$$
+
+$$
+\frac{X_1(f)X_2^*(f)}{\left|X_1(f)X_2^*(f)\right|}
+$$
+
+$$
+\frac{X_1(f)X_2^*(f)}{\left\lvert X_1(f)X_2^*(f) \right\rvert}
+$$
+
+$$
+\frac{X_{1}(f)X_{2}^{*}(f)}{\left|X_{1}(f)X_{2}^{*}(f)\right|}
+$$
+
+$$ 
+\frac{X}{Y} 
+$$
+
+$$ 
+ X_1(f) 
+$$
+
+$$ 
+ X_2^*(f) 
+$$
+
+aa 
+
+$$ 
+ |X_1(f)X_2^*(f)| 
+$$
+
+bb 
+
+$$ 
+ X_2^*(f) 
+$$
+
+It divides out the magnitude of the cross-spectrum, keeping only phase, then inverse-transforms. This works for *any* sufficiently broadband signal because it never assumes anything about $S(f)$'s shape — only that there's usable phase coherence across the band. The whitening is specifically there to fix a problem GCC-PHAT was designed for: **reverberation**. Plain cross-correlation's peak shape is smeared by the source's own spectral coloring and by multipath (each echo path imposes its own magnitude/phase distortion); PHAT flattens magnitude so the peak sharpness is governed only by bandwidth, not by channel coloring.
+
+### Pros / cons
+
+**Step 2 (dechirp + FFT, chirp-matched)**
+- ✅ Full coherent matched-filter gain (~29.5 dB here) — near-optimal in white noise, since it weights each frequency by its actual signal energy rather than artificially flattening it.
+- ✅ Delay → single scalar (beat frequency) rather than a full correlation function — conceptually and computationally convenient for a staged, resource-constrained pipeline (cheap Step 1 gate → small dechirp+FFT only when triggered).
+- ✅ Because you know the beat-frequency band in advance, you can lowpass + decimate the dechirped signal before the FFT — a genuine compute saving on Teensy that a generic method can't claim, since it doesn't know in advance where the "answer" will live spectrally.
+- ❌ Waveform-specific — the whole trick evaporates if the transmit signal isn't LFM.
+- ❌ No whitening, so channel coloring/mild multipath can bias the FFT peak or spread its energy, exactly like it would smear a plain (non-PHAT) cross-correlation.
+- ❌ Still fundamentally limited to ~37-sample resolution by the BT product — needs Step 3 regardless.
+
+**GCC-PHAT**
+- ✅ Signal-agnostic — same mechanism works whether the source is a chirp, speech, or a noise burst. No need to know the transmitted waveform, only need two channels of it (or, per your framing, one real + one synthetic reference channel).
+- ✅ Explicitly designed to sharpen the peak under reverberation/channel coloring, which a raw matched filter doesn't correct for.
+- ✅ One FFT-based cross-correlation covers *all* candidate delays at once — no separate coarse-then-fine staging needed if you can afford an FFT sized to your full delay-uncertainty window.
+- ❌ Whitening weights every bin equally regardless of actual SNR — bins where the received signal is mostly noise get boosted just as much as bins with real signal. This is a well-known weakness: PHAT is not SNR-optimal, and can perform worse than a plain matched filter at low SNR precisely because it throws away the magnitude information that the matched filter would have used to downweight noisy bins.
+- ❌ Ignoring the known chirp structure forfeits "free" coherent gain that Step 2 gets for using the exact transmit law — you're solving a harder, more general problem than you need to.
+
+### One practical takeaway
+
+Since you *do* know the exact transmit waveform here, dechirp+FFT is the right tool — you get matched-filter-optimal gain in white noise essentially for free, plus the LFM-specific decimation trick. GCC-PHAT's real advantage — robustness to spectral coloring from reverberation/multipath — is worth borrowing selectively: if the acoustic path is reverberant, whitening $Y[k]$ (the dechirped spectrum) by its own magnitude before peak-picking in Step 2 would import some of PHAT's multipath robustness without giving up the LFM-specific computational shortcuts. That's a smaller, targeted change rather than replacing Step 2 wholesale with a generic GCC-PHAT.
+
+---
+
+## Question 2
+
+Any research paper exploited advantage of step 2 and GCC-PHAT -- combining the two? Answer in one paragraph.
+
+## Answer
+
+A directly relevant paper is "Dynamic Adjustment of Weighted GCC-PHAT for Position Estimation in an Ultrasonic Local Positioning System" (Pérez-Solano, Ezpeleta, et al., *Sensors*, 2021, https://doi.org/10.3390/s21217051, also at PMC8587089). It uses matched filtering with encoded (chirp-like) emissions as the first detection stage, then applies GCC-PHAT-β with a dynamically adjustable weighting factor β to sharpen the correlation peak — this β acts as a tunable knob between plain cross-correlation (β = 0, matched-filter-optimal, SNR-weighted) and full PHAT whitening (β = 1, flat weighting, robust to multipath/reverberation), letting the system get chirp-matched processing gain at high SNR while blending in phase-transform-style robustness as multipath/reverberation degrades performance. The paper reports that dynamically adapting β cut positioning errors from 20 cm down to 2 cm in 80% of measurements — essentially the hybrid asked about: combining the coherent gain of a chirp-matched correlator (the Step 2 mechanism) with a partial PHAT-style spectral whitening rather than choosing one approach outright.
+
+---
+
+## Question 3
+
+1200 Hz is wide enough to work in GCC-PHAT? Answer in < 3 sentences.
+
+## Answer
+
+Yes — 1200 Hz gives GCC-PHAT the same theoretical resolution as the chirp (Δd ≈ Fs/B ≈ 36.75 samples), since PHAT's resolution depends only on bandwidth, not waveform shape. It's actually a *large* fractional bandwidth (1200 Hz spread around a ~900 Hz center, i.e. ~133%), which is good for PHAT — the bigger risk is that so little energy sits above ~1500 Hz that other real-world noise/interference in that band could dominate the whitened spectrum. So bandwidth-wise it's fine; the practical concern is low absolute SNR per bin after whitening, not insufficient bandwidth.
+
+
+
+
