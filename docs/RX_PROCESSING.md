@@ -840,3 +840,62 @@ Yes — 1200 Hz gives GCC-PHAT the same theoretical resolution as the chirp (Δd
 
 
 
+
+# Step 2 (Dechirp + FFT) vs. Quadrature Demodulation in FSK — Q&A
+
+## Question
+
+Compare step 2 vs quadrature demodulation in FSK. The diff is in FSK, after the mix, DC value remains, but in step 2, a tone remains and simple LPF will not recover this — we need FFT to detect the tone.
+
+## Answer
+
+That's exactly the right distinction, and it comes down to *what the local oscillator (reference) is matched to* in each case.
+
+### FSK quadrature demod: the LO frequency is fixed and matches the hypothesis
+
+In the FSK receiver, you mix the received tone (at $f_1$ or $f_0$) against a local reference at a **fixed** frequency — the same $f_1$ or $f_0$ you're testing for. When the received tone actually matches that LO frequency, the mixing product is:
+
+$$
+I_{raw} = \frac{I}{2} + \frac{I}{2}\cos(2\omega_c t) - \frac{Q}{2}\sin(2\omega_c t)
+$$
+
+The wanted term $I/2$ is **DC** — a constant, not oscillating at all — because the received frequency and the LO frequency are identical, so their difference frequency is exactly 0 Hz. The unwanted term sits way up at $2\omega_c$. A simple LPF cleanly separates the two: everything above the cutoff is discarded, and what's left is a static number you can just read off (then combine as $\sqrt{I^2+Q^2}$ for the energy). LPF works here because "the answer" *is* a DC level — there is no frequency left to identify, only a magnitude.
+
+### Step 2: the LO itself sweeps, so the residual is a tone, not DC
+
+In dechirp, the reference isn't a fixed frequency — it's a chirp with the *same sweep rate* $K$ as the transmitted chirp. If the received chirp is delayed by $\tau$, then at any instant $t$, the received instantaneous frequency is $f_0 + K(t-\tau)$, while the reference's instantaneous frequency is $f_0 + Kt$. Their difference is:
+
+$$
+f_b = K\tau
+$$
+
+a **constant offset**, yes — but not zero unless $\tau = 0$. So the mixing product isn't DC; it's a complex exponential rotating at $f_b$ Hz:
+
+$$
+y[n] = I[n] + jQ[n] \approx Ae^{j2\pi f_b n/F_s}
+$$
+
+An LPF can still remove the unwanted $2\omega_c$ image the same way it does in FSK, but that's a separate job from the one you actually need done here. What survives after the LPF is *still oscillating* at $f_b$ — the LPF doesn't collapse it to a number, because $f_b$ is generally nonzero and unknown (it's the very thing you're trying to measure). Taking $\sqrt{I^2+Q^2}$ the way FSK does would just give you a roughly constant *amplitude* $A$, discarding exactly the piece of information ($f_b$) that encodes the delay. So you need a frequency-selective step — the FFT — to read out *which* frequency the residual tone sits at.
+
+### The core structural difference
+
+| | FSK quadrature demod | Step 2 dechirp |
+|---|---|---|
+| LO / reference | Fixed frequency, one per hypothesis ($f_1$, $f_0$) | Swept (chirp), same rate $K$ as TX |
+| What the unknown is | Which of two known frequencies was sent | An unknown delay $\tau$, encoded as an unknown beat frequency |
+| Residual after mixing (ignoring $2\omega_c$ image) | DC ($I/2$, $Q/2$) | AC tone at $f_b = K\tau$ |
+| Why LPF suffices / doesn't | The wanted information *is* a static level — nothing left to resolve in frequency | The wanted information *is* a frequency — LPF only rejects the image, it can't identify $f_b$ |
+| How the wanted quantity is extracted | Magnitude: $\sqrt{I^2+Q^2}$ (removes unknown phase $\phi$) | Spectrum: FFT + $\arg\max_k \lvert Y[k]\rvert$ (finds unknown frequency $f_b$) |
+| What phase/frequency ambiguity is being defeated | Unknown/drifting phase $\phi$ at a known frequency | Unknown frequency $f_b$ itself, at (implicitly) unknown phase too |
+
+### Why this makes sense conceptually
+
+Both are instances of the same general move — correlate against a hypothesis, then look at what's left — but they push the unknown into different domains on purpose, matched to what's actually unknown at the receiver:
+
+- In FSK, *frequency* is the known, discrete thing (only two candidates, $f_1$/$f_0$), and *phase* is the nuisance parameter. Energy detection ($I^2+Q^2$) is built specifically to erase phase while preserving "was this frequency present."
+- In dechirp ranging, *delay* is the continuous unknown, and it has been deliberately re-encoded as a *frequency* by using a swept (not fixed) reference. Once delay becomes frequency, the natural tool to resolve it is the FFT — the same way FSK's natural tool to resolve amplitude-at-known-frequency was an LPF-then-magnitude.
+
+So the FSK case ends in DC because the reference was chosen to exactly match the thing being tested (a fixed candidate frequency). Step 2's reference matches the transmit chirp's *shape* (its sweep rate) but deliberately does *not* match its *timing* — that timing mismatch is precisely what survives as a nonzero tone, and precisely what the FFT is there to measure.
+
+
+
