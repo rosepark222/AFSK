@@ -84,7 +84,7 @@ Summary:
 ## 4. Quadrature Demodulation (Receiver)
 
 To recover the original data at the receiver, we split the incoming signal into two paths and multiply them by local oscillators.
-
+<img width="1508" height="727" alt="image" src="https://github.com/rosepark222/AFSK/blob/main/docs/quad_dem.png" />
 ### The In-Phase Path ($I$)
 
 Multiply the received signal by $\cos(\omega_c t)$:
