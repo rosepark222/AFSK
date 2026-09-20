@@ -78,14 +78,53 @@ The FFT of `y[n]` turns that phasor's rotation rate into a bin location — `f_b
 
 Had the pipeline instead used real dechirp (`x[n]cos(φ[n])`), the result would be Case 1: a real signal with Hermitian-symmetric spectrum, `Y[-k] = Y[k]^*`. A single real tone at `f_b` always produces **two** equal-magnitude peaks, at `+f_b` and `-f_b` — regardless of which one is physically true. The spectrum cannot encode which is real, because both are always present. Complex mixing avoids this because `y[n]` is no longer real, so Hermitian symmetry no longer applies: `+f_b` and `-f_b` are genuinely different frequencies, giving one peak at the correct signed location.
 
+
+## 3. concrete example ( tau = 100 sample )
+
+
+From `RX_PROCESSING.md`: `K ≈ 1614.844 Hz/s`, `F_s = 44100 Hz`, `N = 32768`, `Δf = F_s/N ≈ 1.346 Hz/bin`.
+
+Suppose the true delay is `τ =  0.00226 s` (chirp arrived 100 samples **later** than the rough alignment assumed):
+$$
+f_b = K\tau = 1614.844 \times (0.00226) \approx 3.66\ \text{Hz}
+$$
+
+- **Real dechirp:** `y[n] = x[n]\cos(\phi[n])` contains `cos(2π(3.66)n/F_s)`. Since `cos(-θ)=cos(θ)`, this is numerically identical to what a `-3.66 Hz` beat would produce. The FFT peak lands at the *same* bin either way. The receiver is left with two equally consistent hypotheses — `τ = -2.26 ms` or `τ = +2.26 ms` — with no way to choose between them. Guessing wrong means a 2*2.26 ms (200-sample) error, not because two things happened, but because the real-valued mix threw away the one bit of information (sign) that would have told it which single thing happened.
+- **Complex dechirp:** `-3.66 Hz` and `+3.66 Hz` land at different bins (`k ≈ N-3` vs. `k ≈ +3`), so the correct, single, actual delay is recoverable directly from the FFT peak location.
+
+<img width="1508" height="727" alt="image" src="https://github.com/rosepark222/AFSK/blob/main/docs/real_correl_problem.png" />
+
+|  Aliased Bin | Physical Frequency ($f_b$ in Hz) | Time Delay ($\tau$ in ms) | Equivalent Delay (Samples) |
+| :--- | :--- | :--- | :--- |
+| 32758 | -13.458 Hz | -8.333 ms | -367.5 samples |
+| 32759 | -12.112 Hz | -7.500 ms | -330.8 samples |
+| 32760 | -10.767 Hz | -6.667 ms | -294.0 samples |
+| 32761 | -9.421 Hz | -5.833 ms | -257.2 samples |
+| 32762 | -8.075 Hz | -5.000 ms | -220.5 samples |
+| 32763 | -6.729 Hz | -4.167 ms | -183.8 samples |
+| 32764 | -5.383 Hz | -3.333 ms | -147.0 samples |
+| 32765 | -4.037 Hz | -2.500 ms | -110.2 samples |
+| 32766 | -2.692 Hz | -1.667 ms | -73.5 samples |
+| 32767 | -1.346 Hz | -0.833 ms | -36.8 samples |
+| 0 | 0.000 Hz | 0.000 ms | 0.0 samples |
+| 1 | 1.346 Hz | 0.833 ms | 36.8 samples |
+| 2 | 2.692 Hz | 1.667 ms | 73.5 samples |
+| 2.721 (Your Peak)** | **3.662 Hz** | **2.268 ms** | **100.0 samples** |
+| 3 | 4.037 Hz | 2.500 ms | 110.2 samples |
+| 4 | 5.383 Hz | 3.333 ms | 147.0 samples |
+| 5 | 6.729 Hz | 4.167 ms | 183.8 samples |
+| 6 | 8.075 Hz | 5.000 ms | 220.5 samples |
+| 7 | 9.421 Hz | 5.833 ms | 257.2 samples |
+| 8 | 10.767 Hz | 6.667 ms | 294.0 samples |
+| 9 | 12.112 Hz | 7.500 ms | 330.8 samples |
+| 10 | 13.458 Hz | 8.333 ms | 367.5 samples |
 ---
 
-## 3. Concrete ambiguity example (using the pipeline's own numbers)
+### another example (using the pipeline's own numbers)
 
 From `RX_PROCESSING.md`: `K ≈ 1614.844 Hz/s`, `F_s = 44100 Hz`, `N = 32768`, `Δf = F_s/N ≈ 1.346 Hz/bin`.
 
 Suppose the true delay is `τ = -0.01 s` (chirp arrived 441 samples **earlier** than the rough alignment assumed):
-
 $$
 f_b = K\tau = 1614.844 \times (-0.01) \approx -16.15\ \text{Hz}
 $$
