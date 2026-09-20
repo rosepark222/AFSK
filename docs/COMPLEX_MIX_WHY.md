@@ -1,6 +1,13 @@
 
 # Why We Mix With a Complex Exponential: From a Toy Example to Chirp Delay Detection
 
+---
+
+one sentence summary : 
+the rx should match the tx signal $\cos(\theta)$ for the matched filter to be correct but rx received $\cos(\theta - \Delta)$, which is the sum of cos and sin. Blindly correlating cos only will eliminates the impact of the sin. Thus, the correct correlation is we correlate cos and sin and place them in complex domain to analyze.
+
+---
+
 This note builds intuition for one specific step in the RX chirp pipeline: **why the dechirp mixer multiplies by `e^{-jφ[n]}` instead of `cos(φ[n])`**. It starts from a one-line algebra example, then connects that example to the actual mix-and-FFT stage used to estimate the time delay `τ`, and finally ties it to the broader idea of analytic-signal correlation.
 
 Companion reading: [`RX_PROCESSING.md`](./RX_PROCESSING.md) (the 3-stage RX pipeline) and the analytic-signal correlation writeup referenced alongside it.
