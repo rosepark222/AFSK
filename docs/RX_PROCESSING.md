@@ -5,7 +5,7 @@ Reference implementation:
 [`dechirp/dechirp_rx_chirp.ino`](https://github.com/rosepark222/AFSK/blob/b8229ef9b513bc4d2d99a7b3131f8f968ce3cb58/dechirp/dechirp_rx_chirp.ino#L329)
 
 ## 1. Chirp model
-
+<img width="1508" height="727" alt="image" src="https://github.com/rosepark222/AFSK/blob/main/docs/chirp_example.png" />
 The receiver processes a linear chirp from $\omega_0 = 2\pi f_0$ to $\omega_1 = 2\pi f_1$ with:
 
 - $f_0 = 300\ \text{Hz}$
@@ -82,7 +82,7 @@ The purpose of each stage is:
 ---
 
 ## 3. Step 1: Real correlation for rough chirp-start detection
-
+<img width="1508" height="727" alt="image" src="https://github.com/rosepark222/AFSK/blob/main/docs/cross_fileA_fileB.png" />
 ### Purpose
 
 The first stage locates the approximate start of the chirp. This is only a coarse estimate. We do not need exact sample alignment here.
@@ -149,6 +149,9 @@ This gives the receiver a rough alignment. The later analytic correlation remove
 ---
 
 ## 4. Step 2: Complex dechirp and FFT
+
+reference: why we need to do complex dechirp
+https://github.com/rosepark222/AFSK/blob/main/docs/COMPLEX_MIX_WHY.md
 
 ### Purpose
 
@@ -321,7 +324,7 @@ This is only a coarse estimate because the FFT bin spacing is finite.
 ---
 
 ## 5. Step 3: Analytic complex correlation for fine delay
-
+<img width="1508" height="727" alt="image" src="https://github.com/rosepark222/AFSK/blob/main/docs/correl_I_Q_100_delay.png" />
 ### Purpose
 
 The FFT gives a coarse estimate of the delay. The final step refines that estimate to the sample level.
