@@ -148,6 +148,16 @@ This gives the receiver a rough alignment. The later analytic correlation remove
 
 ---
 
+## Reference: Dechirp tutorial
+
+<img width="708" height="427" alt="image" src="https://github.com/rosepark222/AFSK/blob/main/docs/dechirp1.png" />
+<img width="708" height="427" alt="image" src="https://github.com/rosepark222/AFSK/blob/main/docs/dechirp2.png" />
+<img width="708" height="427" alt="image" src="https://github.com/rosepark222/AFSK/blob/main/docs/dechirp3.png" />
+<img width="708" height="427" alt="image" src="https://github.com/rosepark222/AFSK/blob/main/docs/dechirp_3_fft.png" />
+
+<img width="708" height="427" alt="image" src="https://github.com/rosepark222/AFSK/blob/main/docs/dechirp4.png" />
+<img width="708" height="427" alt="image" src="https://github.com/rosepark222/AFSK/blob/main/docs/dechirp_4_fft.png" />
+
 ## 4. Step 2: Complex dechirp and FFT
 
 reference: why we need to do complex dechirp
