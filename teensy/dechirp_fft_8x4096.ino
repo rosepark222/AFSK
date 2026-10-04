@@ -102,7 +102,8 @@ index -4, -3 (max), -2, -1 are
 -2      4908.64404297
 -1      1639.22534180
 
-
+Wrong bin/freq/delay table:
+```
 -------bin / freq range / sample range ----------------------
 bin       fre begin freq end          rx lag range
 32765    -4.038    -2.692             73.5	     110.25
@@ -112,8 +113,32 @@ bin       fre begin freq end          rx lag range
 1	     1.346     2.692               -73.5     -36.75	 
 2	     2.692     4.038              -110.25    -73.5	
 3	     4.038     5.384              -147.0    -110.25	
+```
 
+I ran the sim and comapred the peak from cross correlation and the peak from the FFT
+the peak was at -48 sample according to the cross correlation but the FFT shows the peak at bin -1. 
+If the above table is correct, the FFT peak should be at bin -2. It turns out the table was wrong.
 
+Q:
+DC is at the center of bin 0, not the beginning of bin 0 ? Bin 0 represent DC - delta and DC  + delta ?
+Yes, DC is at the center of bin 0. Bin 0 covers DC ± half a bin, not ± a full bin:
+A:
+Bin width Δf = fs/N = 1.3458 Hz
+Bin 0 covers -0.673 Hz to +0.673 Hz
+Bin k covers (k - 0.5)·Δf to (k + 0.5)·Δf
+
+This is why your original table, and my first correction of it, were wrong. Both treated the bin as starting at k·Δf. The corrected table, with 36.75 samples per bin:
+
+Correct bin/freq/delay table:
+| Bin | Center (Hz) | Range (Hz) | RX Delay Range (samples) |
+| :--- | :--- | :--- | :--- |
+| **-3 (32765)** | -4.038 | -4.711 to -3.365 | 110.25 ± 18.4 → 91.9 to 128.6 |
+| **-2 (32766)** | -2.692 | -3.365 to -2.019 | 55.1 to 91.9 |
+| **-1 (32767)** | -1.346 | -2.019 to -0.673 | 18.4 to 55.1 |
+| **0** | 0 | -0.673 to +0.673 | -18.4 to +18.4 |
+| **+1** | +1.346 | +0.673 to +2.019 | -55.1 to -18.4 |
+| **+2** | +2.692 | +2.019 to +3.365 | -91.9 to -55.1 |
+| **+3** | +4.038 | +3.365 to +4.711 | -128.6 to -91.9 |
 -----------------------------------------------------------------
 Q: if rx (a_rx_test_left.txt) is 100 sample delayed version of the reference, which bin in the FFT result would show the max?
 Assume the chirp is 32k sample (0.743 sec duration) of 300hz to 1500hz up chirp.
