@@ -1,0 +1,106 @@
+#include <Audio.h>
+#include <arm_math.h>
+
+// ─── Audio Objects ─────────────────────────────────────────
+AudioPlayQueue     queue;
+AudioOutputI2S     i2s1;
+AudioConnection    patchCord1(queue, 0, i2s1, 0);
+AudioConnection    patchCord2(queue, 0, i2s1, 1);
+
+// ─── Parameters ────────────────────────────────────────────
+#define SAMPLE_RATE     44100
+#define N_SAMPLES       (8 * 4096)                          // 32768 samples
+#define CHIRP_DURATION  ((float)N_SAMPLES / SAMPLE_RATE)    // ~0.743 s
+
+#define F_START 300.0f
+#define F_END   1500.0f
+
+#define ID 0 // ID 5 causes cutoff when 1500 -> 300 transition
+#define NUM_SLOTS 16
+
+#define AMPLITUDE 0.8f // 0.25f
+
+// ─── Buffer ────────────────────────────────────────────────
+int16_t chirp_buffer[N_SAMPLES];
+
+// ─── Generate CLEAN Cyclic Chirp ──────────────────────────
+// raw signal generation -- different from how fsk_tx generates using AudioSynthWaveform
+void generateChirp()
+{
+    float bandwidth = F_END - F_START;
+    float slot_width = bandwidth / NUM_SLOTS;
+    float f0 = F_START + ID * slot_width;
+
+    float k = bandwidth / CHIRP_DURATION;
+
+    float phase = 0.0f;
+
+    for (int n = 0; n < N_SAMPLES; n++) {
+
+        float t = (float)n / SAMPLE_RATE;
+
+        float freq = f0 + k * t;
+
+        // Wrap frequency
+        if (freq > F_END)
+            freq -= bandwidth;
+
+        // Phase accumulator
+        phase += 2.0f * PI * freq / SAMPLE_RATE;
+
+        // Keep phase bounded
+        if (phase > 2 * PI)
+            phase -= 2 * PI;
+
+        float s = sinf(phase);
+
+        // Hann window
+        float w = 0.5f * (1.0f - cosf(2 * PI * n / (N_SAMPLES - 1)));
+
+        float out = AMPLITUDE * s * w;
+
+        chirp_buffer[n] = (int16_t)(out * 32767.0f);
+    }
+}
+
+// ─── Play Function ────────────────────────────────────────
+void playBuffer(int16_t *buf, int len)
+{
+    int idx = 0;
+
+    while (idx < len) {
+
+        if (queue.available() > 0) {
+
+            int16_t *block = (int16_t*)queue.getBuffer();
+
+            for (int i = 0; i < AUDIO_BLOCK_SAMPLES; i++) {
+
+                if (idx < len)
+                    block[i] = buf[idx++];
+                else
+                    block[i] = 0;
+            }
+
+            queue.playBuffer();
+        }
+    }
+}
+
+// ─── Setup ─────────────────────────────────────────────────
+void setup()
+{
+    AudioMemory(100);
+
+    generateChirp();
+}
+
+// ─── Loop ──────────────────────────────────────────────────
+void loop()
+{
+    // Play the chirp (8*4096 samples, ~0.743 s at 44.1 kHz)
+    playBuffer(chirp_buffer, N_SAMPLES);
+
+    // Wait 3 seconds before playing the next chirp
+    delay(3000);
+}
