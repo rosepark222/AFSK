@@ -457,9 +457,7 @@ Subsystems       Speaker / Mic / Chassis (private, report SUCCESS/TIMEOUT/FAIL)
 
 ---
 
-## Addendum: `Superstructure::request()` and `update()` implementations 
----> This is more for FRC SW architecture, rather than Teensy. 
-
+## Q6: `Superstructure::request()` and `update()` implementations 
 
 > Write the `Superstructure::request()` and `update()` bodies for the Teensy, including the settle timer and the gyro-based `TURN`.
 
@@ -632,7 +630,7 @@ Result Superstructure::takeResult() {
 
 ---
 
-## Q: Does concurrent `LISTEN_CHIRP` + `TURN` change the superstructure state definition?
+## Q7: Does concurrent `LISTEN_CHIRP` + `TURN` change the superstructure state definition?
 
 > If robot can do `LISTEN_CHIRP` and `TURN` at the same time, would you change the superstructure state definition?
 >
@@ -739,4 +737,1165 @@ The matrix is data. If a test shows the Mic can hear chirps over motor noise, yo
 | One result | One result per subsystem, plus a join in the sequencer |
 
 If you plan to add the second Teensy, I'd make this change at the same time, since both depend on the same idea: subsystems run independently, and the superstructure only decides what may overlap.
+
+
+---
+
+## Q8:  Sequencer, Superstructure and Subsystems: Single Teensy vs. Extra Dedicated DSP Core
+
+> Let's write Sequencer , Superstructure::request/update for  subsystems Mic, Speaker and Chassis. 
+> Write a markdown doc  implementing the above for the below cases:
+>
+> case 1, assuming we have a single Teensy and Mic work are long-in-time 
+> case 2, assuming we have a dedicated DSP core converting  long-in-time to long-in-wait
+> 
+> and explain differences in Sequencer, Superstructure  and Subsystem design.
+
+## A:
+
+Two implementations of the same layered design (Sequencer → Superstructure → Subsystems), for a robot with a Speaker, a Mic (2 mics) and a Chassis:
+
+| | Case 1: single Teensy | Case 2: dedicated DSP core |
+|---|---|---|
+| Mic work | long-in-time (DSP runs on the main CPU) | long-in-wait (a second Teensy does the DSP; the main Teensy polls) |
+| What can run at once | one subsystem | any set the conflict rules allow (e.g. `LISTEN_CHIRP` + `TURN`) |
+| Sequencer | flat step table, one step at a time | step table with parallel groups |
+| Superstructure | single owner, one global settle timer | active-subsystem mask, conflict matrix, per-subsystem settle timers |
+| Mic subsystem | blocks inside `update()` | polls a serial link in `update()` |
+
+The code is not compiled. Hardware and DSP pieces are stubs marked `TODO`. Logging and per-primitive timing stats from `robot_all_in_one.cpp` are left out here to keep the focus on structure.
+
+**Key idea:** Case 1 is the special case of Case 2. The Case 2 superstructure, given a Mic that declares `blocksCpu = true`, behaves exactly like Case 1 (section 4.5).
+
+---
+
+## 1. Shared building blocks (identical in both cases)
+
+### 1.1 Types
+
+```cpp
+#include <Arduino.h>
+#include <math.h>
+
+enum class Prim : uint8_t { WAIT, LISTEN_CHIRP, COMPUTE_TDOA, COMPUTE_BEARING, TURN, DRIVE,
+                            SEND_CHIRP, SEND_AFSK, LISTEN_AFSK, EXEC_RECEIVED_CMD, COUNT };
+enum class Result : uint8_t { RUNNING, SUCCESS, TIMEOUT, FAIL, ABORTED };
+enum class OnFail : uint8_t { ABORT, RETRY, SKIP, GOTO };
+enum class Join   : uint8_t { ALL, ANY, DEADLINE };       // Case 2 only
+enum : uint8_t { PAR_WITH_NEXT = 1, IS_DEADLINE = 2 };    // Step::flags, Case 2 only
+
+// Bit values so a set of subsystems is a mask. SUB_INT = superstructure-internal work
+// (WAIT, COMPUTE_BEARING): a pseudo-subsystem so every primitive is handled the same way.
+enum Sub : uint8_t { SUB_NONE = 0, SUB_SPK = 1, SUB_MIC = 2, SUB_CHS = 4, SUB_INT = 8 };
+static inline int slot(Sub s) { return s == SUB_SPK ? 0 : s == SUB_MIC ? 1 : s == SUB_CHS ? 2 : 3; }
+
+struct Step {
+  Prim     prim;
+  float    param;        // TURN: deg (NAN = use ctx.bearing) | DRIVE: feet | SEND_AFSK: cmd id |
+                         // COMPUTE_TDOA: 1 or 2 (which measurement)
+  uint32_t timeout_ms;   // limit; DURATION for WAIT and SEND_CHIRP
+  OnFail   onFail;
+  uint8_t  gotoIdx;
+  uint8_t  flags = 0;    // Case 1 tables simply omit these two fields
+  Join     join  = Join::ALL;
+};
+
+struct Context {         // blackboard shared between steps
+  float   theta1, theta2;       // TDOA angles (deg, from robot forward axis, CCW +)
+  float   heading1, heading2;   // yaw (deg) when theta1/theta2 were measured
+  float   bearing;
+  uint8_t rxCmd;
+  uint8_t retries;
+};
+
+static Sub subFor(Prim p) {
+  switch (p) {
+    case Prim::SEND_CHIRP: case Prim::SEND_AFSK:                         return SUB_SPK;
+    case Prim::LISTEN_CHIRP: case Prim::COMPUTE_TDOA: case Prim::LISTEN_AFSK: return SUB_MIC;
+    case Prim::TURN: case Prim::DRIVE:                                   return SUB_CHS;
+    default:                                                             return SUB_INT;
+  }
+}
+```
+
+### 1.2 The subsystem contract and its traits
+
+The superstructure only knows this interface. How a subsystem does its work is its own business. The difference between long-in-wait and long-in-time is declared in `Traits`.
+
+```cpp
+struct Traits {
+  bool blocksCpu;      // update() can run much longer than a loop pass (long-in-time on this CPU)
+  bool needsRealtime;  // must be serviced at a steady rate (e.g. gyro control loop)
+  bool abortable;      // abort() takes effect immediately
+};
+
+class Subsystem {
+public:
+  virtual ~Subsystem() {}
+  virtual Traits traits() const = 0;
+  virtual void   start(const Step& s, Context* ctx) = 0;   // accept a goal, return immediately
+  virtual Result update() = 0;                             // RUNNING until finished
+  virtual void   abort() = 0;                              // make hardware safe now
+  virtual bool   isIdle() const = 0;
+  virtual void   forceIdle() = 0;
+};
+```
+
+### 1.3 Shared helpers
+
+```cpp
+namespace cfg {
+  constexpr float    SPEED_OF_SOUND_MPS = 343.0f;
+  constexpr float    MIC_SPACING_M      = 0.10f;    // TODO
+  constexpr float    BEARING_AGREE_DEG  = 30.0f;
+  constexpr uint32_t SETTLE_CHASSIS_MS  = 300;
+  constexpr uint32_t SETTLE_SPEAKER_MS  = 150;
+  constexpr uint8_t  MAX_RETRIES        = 3;
+  // chassis / gyro constants: see section 1.5
+}
+
+bool cmdToStep(uint8_t cmd, Step& out);   // TODO: same command table as robot_all_in_one.cpp
+void feedWatchdog();                      // TODO: wraps the hardware watchdog feed
+
+static float wrap180(float a) { while (a > 180.0f) a -= 360.0f; while (a <= -180.0f) a += 360.0f; return a; }
+static uint32_t settleMsAfter(Sub s) {
+  return s == SUB_CHS ? cfg::SETTLE_CHASSIS_MS : s == SUB_SPK ? cfg::SETTLE_SPEAKER_MS : 0;
+}
+static uint32_t graceMs(const Step& s) { return s.prim == Prim::SEND_CHIRP ? 200 : 0; }
+
+static float tdoaToAngleDeg(float dtSec) {
+  float s = cfg::SPEED_OF_SOUND_MPS * dtSec / cfg::MIC_SPACING_M;
+  if (s > 1.0f) s = 1.0f; if (s < -1.0f) s = -1.0f;
+  return asinf(s) * 180.0f / (float)M_PI;      // TODO: confirm sign vs gyro (CCW +)
+}
+
+// "Data" steps become concrete at the moment they run.
+static bool resolveStep(Step& s, Context* c, float yawNow) {
+  if (s.prim == Prim::EXEC_RECEIVED_CMD && !cmdToStep(c->rxCmd, s)) return false;
+  if (s.prim == Prim::TURN && isnan(s.param)) s.param = wrap180(c->bearing - yawNow);
+  return true;
+}
+
+// Combine two TDOA angles taken at different headings; removes the front/back ambiguity.
+static bool computeBearing(Context& c) {
+  float a[2] = { c.heading1 + c.theta1, c.heading1 + (180.0f - c.theta1) };
+  float b[2] = { c.heading2 + c.theta2, c.heading2 + (180.0f - c.theta2) };
+  float best = 1e9f; int bi = 0, bj = 0;
+  for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++) {
+    float d = fabsf(wrap180(a[i] - b[j]));
+    if (d < best) { best = d; bi = i; bj = j; }
+  }
+  if (best > cfg::BEARING_AGREE_DEG) return false;
+  c.bearing = wrap180(a[bi] + 0.5f * wrap180(b[bj] - a[bi]));
+  return true;
+}
+
+// Work done by the superstructure itself (SUB_INT).
+static Result runInternal(const Step& s, uint32_t startMs, Context& c) {
+  if (s.prim == Prim::WAIT)
+    return ((int32_t)(millis() - (startMs + s.timeout_ms)) >= 0) ? Result::SUCCESS : Result::RUNNING;
+  if (s.prim == Prim::COMPUTE_BEARING)
+    return computeBearing(c) ? Result::SUCCESS : Result::FAIL;
+  return Result::FAIL;
+}
+```
+
+### 1.4 Speaker (long-in-wait: output plays in the background)
+
+```cpp
+static void     spkStartChirp(uint32_t ms) { /* TODO */ }
+static uint32_t spkStartAfsk(uint8_t cmd)  { /* TODO: modulate + start */ return 500; }  // est. ms
+static void     spkStop()                  { /* TODO */ }
+
+class Speaker : public Subsystem {
+public:
+  Traits traits() const override { return { /*blocksCpu*/false, /*needsRealtime*/false, /*abortable*/true }; }
+
+  void start(const Step& s, Context*) override {
+    if (s.prim == Prim::SEND_CHIRP) { spkStartChirp(s.timeout_ms); endMs_ = millis() + s.timeout_ms; }
+    else                            { endMs_ = millis() + spkStartAfsk((uint8_t)s.param); }
+    busy_ = true;
+  }
+  Result update() override {
+    if (!busy_) return Result::SUCCESS;
+    if ((int32_t)(millis() - endMs_) >= 0) { spkStop(); return Result::SUCCESS; }
+    return Result::RUNNING;
+  }
+  void abort() override        { forceIdle(); }
+  bool isIdle() const override { return !busy_; }
+  void forceIdle() override    { spkStop(); busy_ = false; }
+
+private:
+  bool busy_ = false; uint32_t endMs_ = 0;
+};
+```
+
+### 1.5 Chassis (gyro-based `TURN`, timer-based `DRIVE`, yaw history)
+
+Yaw convention: degrees, CCW (left) positive. The chassis needs a steady service rate, so it declares `needsRealtime`. It keeps a short yaw history so a measurement can be matched to the heading at the moment it was taken (used in Case 2).
+
+```cpp
+static bool readGyroZ_dps(float& dps) { /* TODO: gyro driver, CCW + */ return false; }
+
+namespace cfg {
+  constexpr uint8_t  L_PWM = 2, L_DIR = 3, R_PWM = 4, R_DIR = 5;          // TODO
+  constexpr uint32_t GYRO_PERIOD_US = 2000, GYRO_MAX_DT_US = 20000;
+  constexpr float    TURN_KP = 3.0f, TURN_TOL_DEG = 2.0f, TURN_RATE_OK_DPS = 5.0f;
+  constexpr int      TURN_PWM_MAX = 200, TURN_PWM_MIN = 70;
+  constexpr uint8_t  TURN_HOLD_TICKS = 20;
+  constexpr int      OPENLOOP_TURN_PWM = 140;   constexpr float OPENLOOP_TURN_DPS = 120.0f;
+  constexpr int      DRIVE_PWM = 150;           constexpr float DRIVE_FT_PER_S = 1.0f;
+  constexpr float    HOLD_KP = 2.0f;
+}
+
+class Chassis : public Subsystem {
+public:
+  Traits traits() const override { return { false, /*needsRealtime*/true, true }; }
+
+  void begin() {
+    pinMode(cfg::L_PWM, OUTPUT); pinMode(cfg::L_DIR, OUTPUT);
+    pinMode(cfg::R_PWM, OUTPUT); pinMode(cfg::R_DIR, OUTPUT);
+    setMotors(0, 0);
+    float sum = 0, v; int n = 0;                           // gyro bias: robot must be still
+    for (int i = 0; i < 500; i++) { if (readGyroZ_dps(v)) { sum += v; n++; } delay(1); }
+    gyroOk_ = (n > 400); bias_ = gyroOk_ ? sum / n : 0; lastUs_ = micros();
+  }
+
+  void tickHeading() {                                     // call every loop pass; rate-limited
+    uint32_t nowUs = micros(), dtUs = nowUs - lastUs_;
+    if (dtUs < cfg::GYRO_PERIOD_US) return;
+    lastUs_ = nowUs;
+    if (dtUs > cfg::GYRO_MAX_DT_US) return;                // long gap: skip, don't integrate
+    float raw;
+    if (!readGyroZ_dps(raw)) { if (++badReads_ > 50) gyroOk_ = false; return; }
+    badReads_ = 0; gyroOk_ = true;
+    if (mode_ == STOPPED && fabsf(raw - bias_) < 1.0f) bias_ += 0.001f * (raw - bias_);
+    rate_ = raw - bias_;
+    yaw_  = wrap180(yaw_ + rate_ * (dtUs * 1e-6f));
+    histYaw_[histHead_] = yaw_; histMs_[histHead_] = millis();          // yaw history
+    histHead_ = (histHead_ + 1) % kHist; if (histCount_ < kHist) histCount_++;
+  }
+
+  float yawDeg() const { return yaw_; }
+  float yawAt(uint32_t ms) const {                         // yaw at (or just before) time ms
+    for (uint16_t k = 0; k < histCount_; k++) {
+      uint16_t i = (histHead_ + kHist - 1 - k) % kHist;    // newest first
+      if ((int32_t)(histMs_[i] - ms) <= 0) return histYaw_[i];
+    }
+    return yaw_;                                           // older than history: fall back
+  }
+
+  void start(const Step& s, Context*) override {
+    uint32_t now = millis(); holdTicks_ = 0;
+    if (s.prim == Prim::TURN) {
+      float deg = wrap180(s.param);                        // + = left
+      useGyro_ = gyroOk_;
+      if (useGyro_) targetYaw_ = wrap180(yaw_ + deg);
+      else { pendingDeg_ = deg; dir_ = (deg >= 0) ? 1 : -1;
+             endMs_ = now + (uint32_t)(fabsf(deg) / cfg::OPENLOOP_TURN_DPS * 1000.0f); }
+      mode_ = TURNING;
+    } else {                                               // DRIVE, param = feet
+      holdYaw_ = yaw_; endMs_ = now + (uint32_t)(s.param / cfg::DRIVE_FT_PER_S * 1000.0f); mode_ = DRIVING;
+    }
+  }
+
+  Result update() override {
+    uint32_t now = millis();
+    if (mode_ == TURNING) return updateTurn(now);
+    if (mode_ == DRIVING) return updateDrive(now);
+    return Result::SUCCESS;
+  }
+  void abort() override        { forceIdle(); }
+  bool isIdle() const override { return mode_ == STOPPED; }
+  void forceIdle() override    { setMotors(0, 0); mode_ = STOPPED; }
+
+private:
+  enum Mode : uint8_t { STOPPED, TURNING, DRIVING };
+
+  Result updateTurn(uint32_t now) {
+    if (!useGyro_) {                                       // timer fallback, dead-reckon heading
+      if ((int32_t)(now - endMs_) >= 0) { setMotors(0, 0); yaw_ = wrap180(yaw_ + pendingDeg_); mode_ = STOPPED; return Result::SUCCESS; }
+      setMotors(-cfg::OPENLOOP_TURN_PWM * dir_, +cfg::OPENLOOP_TURN_PWM * dir_);
+      return Result::RUNNING;
+    }
+    float err = wrap180(targetYaw_ - yaw_);                // + = still need to turn left
+    bool inTol = fabsf(err) < cfg::TURN_TOL_DEG, still = fabsf(rate_) < cfg::TURN_RATE_OK_DPS;
+    if (inTol) {
+      setMotors(0, 0);
+      if (still && ++holdTicks_ >= cfg::TURN_HOLD_TICKS) { mode_ = STOPPED; return Result::SUCCESS; }
+      if (!still) holdTicks_ = 0;
+      return Result::RUNNING;
+    }
+    holdTicks_ = 0;
+    float cmd = cfg::TURN_KP * err;
+    if (cmd >  cfg::TURN_PWM_MAX) cmd =  cfg::TURN_PWM_MAX;
+    if (cmd < -cfg::TURN_PWM_MAX) cmd = -cfg::TURN_PWM_MAX;
+    if (fabsf(cmd) < cfg::TURN_PWM_MIN) cmd = copysignf(cfg::TURN_PWM_MIN, err);
+    setMotors(-(int)cmd, +(int)cmd);                       // overshoot corrects itself (err flips sign)
+    return Result::RUNNING;
+  }
+
+  Result updateDrive(uint32_t now) {
+    if ((int32_t)(now - endMs_) >= 0) { setMotors(0, 0); mode_ = STOPPED; return Result::SUCCESS; }
+    float corr = gyroOk_ ? cfg::HOLD_KP * wrap180(holdYaw_ - yaw_) : 0.0f;
+    setMotors((int)(cfg::DRIVE_PWM - corr), (int)(cfg::DRIVE_PWM + corr));
+    return Result::RUNNING;
+  }
+
+  void setMotors(int l, int r) {                           // TODO: match your driver
+    auto drv = [](uint8_t pwm, uint8_t dir, int v) {
+      if (v > 255) v = 255; if (v < -255) v = -255;
+      digitalWriteFast(dir, v >= 0 ? HIGH : LOW); analogWrite(pwm, abs(v));
+    };
+    drv(cfg::L_PWM, cfg::L_DIR, l); drv(cfg::R_PWM, cfg::R_DIR, r);
+  }
+
+  static constexpr uint16_t kHist = 512;                   // ~1 s at 500 Hz
+  Mode mode_ = STOPPED;
+  float yaw_ = 0, bias_ = 0, rate_ = 0, targetYaw_ = 0, pendingDeg_ = 0, holdYaw_ = 0;
+  uint32_t lastUs_ = 0, endMs_ = 0;
+  uint8_t badReads_ = 0, holdTicks_ = 0; int8_t dir_ = 1;
+  bool gyroOk_ = false, useGyro_ = false;
+  float histYaw_[kHist]; uint32_t histMs_[kHist]; uint16_t histHead_ = 0, histCount_ = 0;
+};
+```
+
+---
+
+## 2. Case 1: single Teensy, Mic is long-in-time
+
+One CPU runs both the control loop and the DSP. While the Mic is processing, nothing else can be serviced, so the design allows only one subsystem at a time.
+
+### 2.1 Mic: runs the whole DSP inside `update()`
+
+Declares `blocksCpu`. Not abortable from outside, because `update()` is running when anything else could happen. Instead, its own loops check the deadline and feed the hardware watchdog.
+
+```cpp
+// DSP stubs: your existing dechirp and FSK demod code
+void micFlush();                          // discard stale audio
+bool micGetBlock();                       // true when a new block is ready
+bool roughCorrelation();                  // stage 1, cheap reject
+bool mixFFT();                            // stage 2
+bool fineCorrelation();                   // stage 3, confirm; fills the capture buffers
+bool micTdoaSeconds(float& dt);           // cross-correlate the two channels
+bool afskDecodeFrame(uint8_t& cmd);
+
+class MicOwnDsp : public Subsystem {
+public:
+  Traits traits() const override { return { /*blocksCpu*/true, false, /*abortable*/false }; }
+
+  void start(const Step& s, Context* ctx) override {
+    ctx_ = ctx; param_ = s.param; prim_ = s.prim; deadlineMs_ = millis() + s.timeout_ms; busy_ = true;
+  }
+
+  Result update() override {                               // may run for seconds
+    switch (prim_) {
+      case Prim::LISTEN_CHIRP: return listenChirp();
+      case Prim::COMPUTE_TDOA: return computeTdoa();
+      case Prim::LISTEN_AFSK:  return listenAfsk();
+      default:                 return Result::FAIL;
+    }
+  }
+  void abort() override        { busy_ = false; }          // can only reset state
+  bool isIdle() const override { return !busy_; }
+  void forceIdle() override    { busy_ = false; }
+
+private:
+  bool late() const { return (int32_t)(millis() - deadlineMs_) >= 0; }
+
+  Result listenChirp() {
+    micFlush();
+    while (!late()) {
+      feedWatchdog();                                      // deadline + watchdog INSIDE the loop
+      if (!micGetBlock())      continue;
+      if (!roughCorrelation()) continue;
+      if (!mixFFT())           continue;
+      if (!fineCorrelation())  continue;
+      return Result::SUCCESS;
+    }
+    return Result::TIMEOUT;
+  }
+  Result computeTdoa() {
+    float dt; if (!micTdoaSeconds(dt)) return Result::FAIL;
+    float deg = tdoaToAngleDeg(dt);
+    if ((int)param_ == 1) ctx_->theta1 = deg; else ctx_->theta2 = deg;
+    return Result::SUCCESS;
+  }
+  Result listenAfsk() {
+    micFlush();
+    while (!late()) { feedWatchdog(); uint8_t c; if (afskDecodeFrame(c)) { ctx_->rxCmd = c; return Result::SUCCESS; } }
+    return Result::TIMEOUT;
+  }
+
+  Context* ctx_ = nullptr; Prim prim_ = Prim::LISTEN_CHIRP; float param_ = 0;
+  uint32_t deadlineMs_ = 0; bool busy_ = false;
+};
+```
+
+### 2.2 Superstructure: single owner, global settle timer
+
+States: `IDLE`, `ACTIVE` (one owner, which may be `SUB_INT`), `SETTLING`.
+
+```
+IDLE --request--> ACTIVE --finish--> SETTLING | IDLE
+SETTLING --timer expires--> IDLE
+```
+
+A request for a different subsystem is refused during `SETTLING`. The same subsystem, and internal steps, are allowed.
+
+```cpp
+class Superstructure {
+public:
+  void begin() {
+    sub_[0] = &speaker_; sub_[1] = &mic_; sub_[2] = &chassis_;
+    chassis_.begin();
+  }
+
+  // The ONLY way to start work. false = "not now, ask again".
+  bool request(const Step& in, Context* ctx) {
+    if (state_ == State::ACTIVE) return false;             // one thing at a time
+
+    Step s = in;
+    if (!resolveStep(s, ctx, chassis_.yawDeg())) {         // e.g. unknown received command
+      active_ = in; ctx_ = ctx; owner_ = SUB_INT; startMs_ = millis(); state_ = State::ACTIVE;
+      finish(Result::FAIL);
+      return true;                                         // accepted; result = FAIL
+    }
+
+    Sub need = subFor(s.prim);
+    if (need != SUB_INT) {
+      if (settling() && need != lastOwner_) return false;  // quiet period for a different subsystem
+      if (!allIdle())                       return false;  // invariant check
+    }
+    active_ = s; ctx_ = ctx; owner_ = need; startMs_ = millis();
+    deadlineMs_ = startMs_ + s.timeout_ms + graceMs(s);
+    lastResult_ = Result::RUNNING;
+    state_ = State::ACTIVE;
+    if (need != SUB_INT) sub_[slot(need)]->start(s, ctx);
+    return true;
+  }
+
+  // Called every loop pass. A blocksCpu subsystem's update() may run long.
+  void update() {
+    chassis_.tickHeading();                                // heading integration always runs
+    if (state_ == State::SETTLING) { if (!settling()) { settleActive_ = false; state_ = State::IDLE; } return; }
+    if (state_ != State::ACTIVE) return;
+
+    Result r;
+    if (owner_ == SUB_INT) {
+      r = runInternal(active_, startMs_, *ctx_);
+    } else {
+      r = sub_[slot(owner_)]->update();
+      if (r == Result::RUNNING && (int32_t)(millis() - deadlineMs_) >= 0) r = Result::TIMEOUT;
+    }
+    if (r == Result::SUCCESS && active_.prim == Prim::COMPUTE_TDOA) {
+      if ((int)active_.param == 1) ctx_->heading1 = chassis_.yawDeg();   // heading "now"
+      else                         ctx_->heading2 = chassis_.yawDeg();
+    }
+    if (r != Result::RUNNING) finish(r);
+  }
+
+  void emergencyStop() {
+    chassis_.forceIdle();                                  // motors off, no matter what
+    if (state_ == State::ACTIVE) finish(Result::ABORTED);
+  }
+  Result takeResult() { Result r = lastResult_; lastResult_ = Result::RUNNING; return r; }   // one-shot
+
+private:
+  enum class State : uint8_t { IDLE, ACTIVE, SETTLING };
+
+  bool settling() const { return settleActive_ && (int32_t)(millis() - settleUntil_) < 0; }
+  bool allIdle() const { for (int i = 0; i < 3; i++) if (!sub_[i]->isIdle()) return false; return true; }
+
+  void finish(Result r) {                                  // the single release path
+    uint32_t now = millis();
+    if (owner_ != SUB_INT) {
+      Subsystem* sub = sub_[slot(owner_)];
+      if (r != Result::SUCCESS) sub->abort();
+      sub->forceIdle();
+      uint32_t ms = settleMsAfter(owner_);
+      settleActive_ = ms > 0;
+      if (ms) settleUntil_ = now + ms;
+      lastOwner_ = owner_;
+    }
+    lastResult_ = r; owner_ = SUB_NONE;
+    state_ = settling() ? State::SETTLING : State::IDLE;
+  }
+
+  Speaker speaker_; MicOwnDsp mic_; Chassis chassis_;
+  Subsystem* sub_[3] = {};
+  State state_ = State::IDLE; Sub owner_ = SUB_NONE, lastOwner_ = SUB_NONE;
+  Step active_{}; Context* ctx_ = nullptr; Result lastResult_ = Result::RUNNING;
+  uint32_t startMs_ = 0, deadlineMs_ = 0, settleUntil_ = 0; bool settleActive_ = false;
+};
+```
+
+### 2.3 Sequencer: flat step table
+
+```cpp
+class Sequencer {
+public:
+  enum State : uint8_t { IDLE, REQUEST, WAIT, DONE, FAILED };
+  explicit Sequencer(Superstructure& s) : sup_(s) {}
+
+  void load(const Step* steps, uint8_t n, Context* ctx) { steps_ = steps; n_ = n; ctx_ = ctx; }
+  void start() { i_ = 0; ctx_->retries = 0; state_ = REQUEST; }
+  void abort() { sup_.emergencyStop(); state_ = FAILED; }
+
+  void update() {
+    switch (state_) {
+      case REQUEST:
+        if (sup_.request(steps_[i_], ctx_)) state_ = WAIT;       // refused? ask again next pass
+        break;
+      case WAIT: {
+        Result r = sup_.takeResult();
+        if (r == Result::RUNNING) break;
+        if (r == Result::SUCCESS) { advance(); break; }
+        if (r == Result::ABORTED) { state_ = FAILED; break; }
+        const Step& s = steps_[i_];                              // TIMEOUT / FAIL: step's policy
+        switch (s.onFail) {
+          case OnFail::GOTO:  ctx_->retries = 0; i_ = s.gotoIdx; state_ = REQUEST; break;
+          case OnFail::RETRY: state_ = (++ctx_->retries < cfg::MAX_RETRIES) ? REQUEST : FAILED; break;
+          case OnFail::SKIP:  advance(); break;
+          default:            state_ = FAILED; break;
+        }
+        break;
+      }
+      default: break;
+    }
+  }
+
+private:
+  void advance() { ctx_->retries = 0; if (++i_ >= n_) state_ = DONE; else state_ = REQUEST; }
+
+  Superstructure& sup_; const Step* steps_ = nullptr; uint8_t n_ = 0, i_ = 0;
+  Context* ctx_ = nullptr; State state_ = IDLE;
+};
+```
+
+### 2.4 Robot A sequence and main loop
+
+```cpp
+static const Step SEQ_A[] = {
+  { Prim::LISTEN_CHIRP,    0,    10000, OnFail::ABORT, 0 },   // 0
+  { Prim::COMPUTE_TDOA,    1,      500, OnFail::ABORT, 0 },   // 1  theta1, heading1
+  { Prim::TURN,            90,    3000, OnFail::ABORT, 0 },   // 2
+  { Prim::WAIT,            0,      300, OnFail::ABORT, 0 },   // 3  settle
+  { Prim::LISTEN_CHIRP,    0,    10000, OnFail::ABORT, 0 },   // 4
+  { Prim::COMPUTE_TDOA,    2,      500, OnFail::ABORT, 0 },   // 5  theta2, heading2
+  { Prim::COMPUTE_BEARING, 0,       10, OnFail::ABORT, 0 },   // 6
+  { Prim::TURN,            NAN,    3000, OnFail::ABORT, 0 },  // 7  NAN = use ctx.bearing
+  { Prim::DRIVE,           1.0f,   4000, OnFail::ABORT, 0 },  // 8  feet
+  { Prim::SEND_AFSK,       1 /*CMD_STOP_CHIRP*/, 1500, OnFail::RETRY, 0 },   // 9
+};
+
+void loop() {
+  feedWatchdog();
+  sup.update();     // a Mic primitive may run long inside this call
+  seq.update();
+}
+```
+
+---
+
+## 3. Case 2: dedicated DSP core, Mic is long-in-wait
+
+The DSP Teensy owns the microphones and runs the dechirp, correlation and FSK demod. The main Teensy sends commands and polls results over a serial link. Every `update()` is now short, so the main Teensy can run several subsystems together.
+
+### 3.1 Mic: proxy for the DSP Teensy
+
+```cpp
+// Link to the DSP Teensy (UART/SPI). TODO: framing + CRC + heartbeat.
+struct DspMsg { uint8_t type; float tdoaSec; uint32_t arrivalMs; uint8_t cmd; };
+enum : uint8_t { DSP_CHIRP_RESULT = 1, DSP_AFSK_RESULT = 2, DSP_TIMEOUT = 3 };
+void dspSendStart(uint8_t kind, uint32_t timeoutMs);   // kind: 1 = chirp, 2 = afsk
+void dspSendAbort();
+bool dspPoll(DspMsg& m);       // true when a complete, CRC-valid frame was parsed (cheap)
+bool dspAlive();               // heartbeat seen recently
+// DspMsg::arrivalMs must already be mapped to THIS Teensy's millis() clock (TODO: clock sync)
+
+class MicProxy : public Subsystem {
+public:
+  Traits traits() const override { return { /*blocksCpu*/false, false, /*abortable*/true }; }
+  uint32_t lastArrivalMs() const { return last_.arrivalMs; }
+
+  void start(const Step& s, Context* ctx) override {
+    ctx_ = ctx; param_ = s.param; prim_ = s.prim; busy_ = true;
+    if (prim_ == Prim::LISTEN_CHIRP) dspSendStart(1, s.timeout_ms);
+    if (prim_ == Prim::LISTEN_AFSK)  dspSendStart(2, s.timeout_ms);
+    // COMPUTE_TDOA needs no message: the DSP already included the TDOA in its chirp result
+  }
+
+  Result update() override {                               // every call takes microseconds
+    if (!busy_) return Result::FAIL;
+    if (prim_ == Prim::COMPUTE_TDOA) {                     // local math on the stored result
+      float deg = tdoaToAngleDeg(last_.tdoaSec);
+      if ((int)param_ == 1) ctx_->theta1 = deg; else ctx_->theta2 = deg;
+      return Result::SUCCESS;
+    }
+    if (!dspAlive()) return Result::FAIL;                  // DSP board died or went silent
+    DspMsg m;
+    while (dspPoll(m)) {
+      if (prim_ == Prim::LISTEN_CHIRP && m.type == DSP_CHIRP_RESULT) { last_ = m; return Result::SUCCESS; }
+      if (prim_ == Prim::LISTEN_AFSK  && m.type == DSP_AFSK_RESULT)  { ctx_->rxCmd = m.cmd; return Result::SUCCESS; }
+      if (m.type == DSP_TIMEOUT) return Result::TIMEOUT;
+    }
+    return Result::RUNNING;
+  }
+  void abort() override        { dspSendAbort(); busy_ = false; }
+  bool isIdle() const override { return !busy_; }
+  void forceIdle() override    { busy_ = false; }
+
+private:
+  Context* ctx_ = nullptr; Prim prim_ = Prim::LISTEN_CHIRP; float param_ = 0;
+  DspMsg last_{}; bool busy_ = false;
+};
+```
+
+### 3.2 Superstructure: active mask, conflict rules, per-subsystem settle
+
+Instead of one owner, it keeps `activeMask_` and one record per subsystem. A request is a **group** of steps that must all be accepted, or none are (atomic start), so branches start in the same loop pass.
+
+**What may overlap** comes from two sources:
+
+1. A data table for acoustics: the speaker deafens the mic. Add motor-noise entries only if your test shows motors mask the chirp.
+2. A rule derived from the traits: a subsystem that `blocksCpu` conflicts with one that `needsRealtime`.
+
+**Refusal reasons** are split so the sequencer can tell "wait" from "give up":
+
+| Refusal | Meaning | Sequencer action |
+|---|---|---|
+| `BUSY` | subsystem or a conflicting one is active | ask again next pass |
+| `SETTLING` | per-subsystem quiet timer still running | ask again next pass |
+| `CONFLICT` | these branches can never run together | fail immediately (table error) |
+| `INVALID` | bad step (e.g. unknown received command) | fail immediately |
+
+```cpp
+enum class Refusal : uint8_t { NONE, BUSY, SETTLING, CONFLICT, INVALID };
+
+class Superstructure {
+public:
+  static constexpr uint8_t kMaxGroup = 4;
+
+  void begin() {
+    sub_[0] = &speaker_; sub_[1] = &mic_; sub_[2] = &chassis_;   // sub_[3] (SUB_INT) is handled internally
+    chassis_.begin();
+  }
+
+  // Atomic: starts all n steps or none. outSubs[k] tells the caller which subsystem runs step k.
+  Refusal requestGroup(const Step* in, uint8_t n, Context* ctx, Sub* outSubs) {
+    if (n == 0 || n > kMaxGroup) return Refusal::INVALID;
+    Step s[kMaxGroup]; Sub need[kMaxGroup]; uint8_t groupMask = 0;
+
+    for (uint8_t k = 0; k < n; k++) {                                // 1. resolve and validate the group
+      s[k] = in[k];
+      if (!resolveStep(s[k], ctx, chassis_.yawDeg())) return Refusal::INVALID;
+      need[k] = subFor(s[k].prim);
+      if (groupMask & need[k]) return Refusal::CONFLICT;             // two branches, same subsystem
+      groupMask |= need[k];
+    }
+    for (uint8_t k = 0; k < n; k++)
+      if (conflictsOf(need[k]) & groupMask) return Refusal::CONFLICT;   // can never run together
+
+    if (activeMask_ & groupMask) return Refusal::BUSY;               // 2. transient reasons
+    for (uint8_t k = 0; k < n; k++)
+      if (conflictsOf(need[k]) & activeMask_) return Refusal::BUSY;
+    for (uint8_t k = 0; k < n; k++)
+      if (isQuiet(need[k])) return Refusal::SETTLING;
+
+    uint32_t now = millis();                                         // 3. start everything, atomically
+    for (uint8_t k = 0; k < n; k++) {
+      Slot& sl = slots_[slot(need[k])];
+      sl.step = s[k]; sl.ctx = ctx; sl.startMs = now;
+      sl.deadlineMs = now + s[k].timeout_ms + graceMs(s[k]);
+      sl.hasResult = false; sl.result = Result::RUNNING;
+      activeMask_ |= need[k];
+      if (need[k] != SUB_INT) sub_[slot(need[k])]->start(s[k], ctx);
+      outSubs[k] = need[k];
+    }
+    return Refusal::NONE;
+  }
+
+  // Every loop pass: non-blocking subsystems first, blocking ones last.
+  void update() {
+    chassis_.tickHeading();
+    for (int pass = 0; pass < 2; pass++)
+      for (int i = 0; i < 4; i++) {
+        Sub s = (Sub)(1 << i);
+        if (!(activeMask_ & s)) continue;
+        bool blocking = sub_[i] && sub_[i]->traits().blocksCpu;
+        if (blocking == (pass == 1)) service(s);
+      }
+  }
+
+  Result pollResult(Sub s) {                                         // one-shot, per subsystem
+    Slot& sl = slots_[slot(s)];
+    if (!sl.hasResult) return Result::RUNNING;
+    sl.hasResult = false; return sl.result;
+  }
+
+  void abort(Sub s) {                                                // cancel ONE running branch
+    if (activeMask_ & s) finish(s, Result::ABORTED);
+    slots_[slot(s)].hasResult = false;                               // caller does not want this result
+  }
+
+  void emergencyStop() {
+    chassis_.forceIdle();
+    for (int i = 0; i < 4; i++) if (activeMask_ & (1 << i)) finish((Sub)(1 << i), Result::ABORTED);
+  }
+
+private:
+  struct Slot {
+    Step step{}; Context* ctx = nullptr;
+    uint32_t startMs = 0, deadlineMs = 0, quietUntil = 0;
+    Result result = Result::RUNNING; bool hasResult = false, quietActive = false;
+  };
+
+  // What can NOT run together with s: acoustic table + rule derived from the traits.
+  uint8_t conflictsOf(Sub s) const {
+    static const uint8_t ACOUSTIC[3] = {
+      SUB_MIC,   // speaker deafens the mics
+      SUB_SPK,   // mic vs speaker. Add "| SUB_CHS" if motor noise masks the chirp
+      0          // chassis.      Add "| SUB_MIC" in the same case (keep the table symmetric)
+    };
+    if (s == SUB_INT) return 0;
+    uint8_t c = ACOUSTIC[slot(s)];
+    Traits t = sub_[slot(s)]->traits();
+    for (int i = 0; i < 3; i++) {
+      Sub o = (Sub)(1 << i);
+      if (o == s) continue;
+      Traits u = sub_[i]->traits();
+      if ((t.blocksCpu && u.needsRealtime) || (u.blocksCpu && t.needsRealtime)) c |= o;
+    }
+    return c;
+  }
+
+  bool isQuiet(Sub s) const {
+    const Slot& sl = slots_[slot(s)];
+    return sl.quietActive && (int32_t)(millis() - sl.quietUntil) < 0;
+  }
+
+  void service(Sub s) {
+    Slot& sl = slots_[slot(s)];
+    Result r;
+    if (s == SUB_INT) {
+      r = runInternal(sl.step, sl.startMs, *sl.ctx);
+    } else {
+      r = sub_[slot(s)]->update();
+      if (r == Result::RUNNING && (int32_t)(millis() - sl.deadlineMs) >= 0) r = Result::TIMEOUT;
+    }
+    if (r == Result::SUCCESS && sl.step.prim == Prim::COMPUTE_TDOA) {
+      float y = chassis_.yawAt(mic_.lastArrivalMs());                // heading when the chirp ARRIVED
+      if ((int)sl.step.param == 1) sl.ctx->heading1 = y; else sl.ctx->heading2 = y;
+    }
+    if (r != Result::RUNNING) finish(s, r);
+  }
+
+  void finish(Sub s, Result r) {                                     // the single release path
+    Slot& sl = slots_[slot(s)];
+    if (s != SUB_INT) {
+      if (r != Result::SUCCESS) sub_[slot(s)]->abort();
+      sub_[slot(s)]->forceIdle();
+    }
+    activeMask_ &= (uint8_t)~(uint8_t)s;
+    sl.result = r; sl.hasResult = true;
+
+    uint32_t ms = settleMsAfter(s);                                  // quiet period ONLY for subsystems
+    if (ms) {                                                        // that conflict with s
+      uint8_t cf = conflictsOf(s); uint32_t until = millis() + ms;
+      for (int i = 0; i < 3; i++) if (cf & (1 << i)) {
+        Slot& q = slots_[i];
+        if (!q.quietActive || (int32_t)(until - q.quietUntil) > 0) q.quietUntil = until;
+        q.quietActive = true;
+      }
+    }
+  }
+
+  Speaker speaker_; MicProxy mic_; Chassis chassis_;
+  Subsystem* sub_[4] = {};
+  Slot slots_[4]; uint8_t activeMask_ = 0;
+};
+```
+
+### 3.3 Sequencer: groups and join policies
+
+A group is a run of consecutive rows where every row except the last has `PAR_WITH_NEXT`. The join policy and failure policy are read from the **last** row. A normal step is a group of size 1, so there is no special case.
+
+| Join | Group finishes when |
+|---|---|
+| `ALL` | every branch has finished |
+| `ANY` | the first branch finishes (the rest are aborted) |
+| `DEADLINE` | the branch marked `IS_DEADLINE` finishes (the rest are aborted) |
+
+Any non-success result aborts the remaining branches and fails the group. A group-level timeout stops a stuck join from waiting forever.
+
+```cpp
+class Sequencer {
+public:
+  enum State : uint8_t { IDLE, REQUEST, WAIT, DONE, FAILED };
+  static constexpr uint8_t kMaxGroup = Superstructure::kMaxGroup;
+
+  explicit Sequencer(Superstructure& s) : sup_(s) {}
+  void load(const Step* steps, uint8_t n, Context* ctx) { steps_ = steps; n_ = n; ctx_ = ctx; }
+  void start() { i_ = 0; ctx_->retries = 0; state_ = REQUEST; }
+  void abort() { sup_.emergencyStop(); state_ = FAILED; }
+
+  void update() {
+    switch (state_) {
+      case REQUEST: {
+        Group g = groupAt(i_);
+        Refusal why = sup_.requestGroup(&steps_[g.first], g.count, ctx_, subs_);
+        if (why == Refusal::NONE) {
+          uint32_t maxT = 0;
+          for (uint8_t k = 0; k < g.count; k++) {
+            done_[k] = false; res_[k] = Result::RUNNING;
+            if (steps_[g.first + k].timeout_ms > maxT) maxT = steps_[g.first + k].timeout_ms;
+          }
+          groupDeadlineMs_ = millis() + maxT + 500;                  // group-level timeout
+          state_ = WAIT;
+        } else if (why == Refusal::CONFLICT || why == Refusal::INVALID) {
+          state_ = FAILED;                                           // table error: fail fast
+        }                                                            // BUSY / SETTLING: ask again
+        break;
+      }
+
+      case WAIT: {
+        Group g = groupAt(i_);
+        const Step& last = steps_[g.first + g.count - 1];
+        bool allDone = true, anyDone = false, deadlineDone = false, bad = false, aborted = false;
+
+        for (uint8_t k = 0; k < g.count; k++) {
+          if (!done_[k]) {
+            Result r = sup_.pollResult(subs_[k]);
+            if (r != Result::RUNNING) { done_[k] = true; res_[k] = r; }
+          }
+          if (done_[k]) {
+            anyDone = true;
+            if (res_[k] == Result::ABORTED) aborted = true;
+            if (res_[k] != Result::SUCCESS) bad = true;
+            if (steps_[g.first + k].flags & IS_DEADLINE) deadlineDone = true;
+          } else {
+            allDone = false;
+          }
+        }
+        if ((int32_t)(millis() - groupDeadlineMs_) >= 0) bad = true; // group-level timeout
+
+        bool finished = bad ||
+          (last.join == Join::ALL      && allDone)      ||
+          (last.join == Join::ANY      && anyDone)      ||
+          (last.join == Join::DEADLINE && deadlineDone);
+        if (!finished) break;
+
+        for (uint8_t k = 0; k < g.count; k++)                        // cancel whatever is still running
+          if (!done_[k]) sup_.abort(subs_[k]);
+
+        if (aborted) { state_ = FAILED; break; }                     // e-stop: never retry
+        finishGroup(!bad, g, last);
+        break;
+      }
+      default: break;
+    }
+  }
+
+private:
+  struct Group { uint8_t first, count; };
+
+  Group groupAt(uint8_t i) const {
+    uint8_t j = i;
+    while ((steps_[j].flags & PAR_WITH_NEXT) && j + 1 < n_) j++;
+    return { i, (uint8_t)(j - i + 1) };
+  }
+
+  void finishGroup(bool ok, const Group& g, const Step& last) {
+    if (ok) { ctx_->retries = 0; advanceTo(g.first + g.count); return; }
+    switch (last.onFail) {
+      case OnFail::GOTO:  ctx_->retries = 0; i_ = last.gotoIdx; state_ = REQUEST; break;
+      case OnFail::RETRY: state_ = (++ctx_->retries < cfg::MAX_RETRIES) ? REQUEST : FAILED; break;  // restarts the whole group
+      case OnFail::SKIP:  advanceTo(g.first + g.count); break;
+      default:            state_ = FAILED; break;
+    }
+  }
+  void advanceTo(uint8_t next) { i_ = next; state_ = (i_ >= n_) ? DONE : REQUEST; }
+
+  Superstructure& sup_; const Step* steps_ = nullptr; uint8_t n_ = 0, i_ = 0;
+  Context* ctx_ = nullptr; State state_ = IDLE;
+  Sub subs_[kMaxGroup]; bool done_[kMaxGroup]; Result res_[kMaxGroup]; uint32_t groupDeadlineMs_ = 0;
+};
+```
+
+### 3.4 Robot A sequence with a parallel group, and main loop
+
+"Sweep and listen": rotate through a full circle while listening, and stop as soon as the chirp is found. `LISTEN_CHIRP` is the deadline branch, so the group ends when listening ends and the turn is cancelled. Heading is taken from the yaw history at the chirp's arrival time, so it is correct even though the robot was turning.
+
+```cpp
+static const Step SEQ_A_SWEEP[] = {
+  { Prim::LISTEN_CHIRP, 0,   12000, OnFail::ABORT, 0, PAR_WITH_NEXT | IS_DEADLINE },   // 0 ┐ one group
+  { Prim::TURN,         360, 12000, OnFail::ABORT, 0, 0, Join::DEADLINE },             // 1 ┘ join read here
+  { Prim::COMPUTE_TDOA, 1,     500, OnFail::ABORT, 0 },                                // 2  theta1, heading1 (at arrival)
+  // ...remaining rows as in SEQ_A (turn 90, listen, TDOA 2, bearing, turn, drive, send AFSK)
+};
+
+void loop() {                 // identical to Case 1
+  feedWatchdog();
+  sup.update();               // every subsystem update() is short now
+  seq.update();
+}
+```
+
+---
+
+## 4. What differs, and why
+
+### 4.1 Sequencer
+
+| | Case 1 | Case 2 |
+|---|---|---|
+| Unit of execution | one step | one group (a step is a group of size 1) |
+| Table format | 5 fields | adds `flags` and `join` (default to 0, so Case 1 tables still work) |
+| Talks to the superstructure with | `request()` → `bool`, `takeResult()` | `requestGroup()` → `Refusal`, `pollResult(Sub)`, `abort(Sub)` |
+| Refusal handling | any refusal = ask again | `BUSY`/`SETTLING` = ask again; `CONFLICT`/`INVALID` = fail fast |
+| Results | one result per step | one result per branch, combined by `ALL`/`ANY`/`DEADLINE` |
+| Extra duties | none | cancel unfinished branches, group-level timeout, retry restarts the whole group |
+| Load-time checks | optional | recommended: distinct subsystems per group, no `GOTO` into a group, one deadline row |
+
+The failure policies (`ABORT`/`RETRY`/`SKIP`/`GOTO`) and the shared context are unchanged.
+
+### 4.2 Superstructure
+
+| | Case 1 | Case 2 |
+|---|---|---|
+| "Who is active" | one `owner_` | `activeMask_` plus a record per subsystem |
+| State machine | `IDLE`, `ACTIVE`, `SETTLING` (global) | no global state: the mask is the state; settle is per subsystem |
+| Exclusion rule | at most one active | conflict rule: acoustic table + derived traits rule |
+| Settle timer | one global timer; a different subsystem waits | per-subsystem quiet timers, set only on subsystems that conflict with the one that released |
+| `request()` | single step, `bool` | atomic group start, refusal reason |
+| `update()` | services the one owner | services every active subsystem, non-blocking first, blocking last |
+| Deadlines | backstop after `update()` returns; blocking subsystems check their own | same, but per subsystem, and ordinarily enforceable because updates are short |
+| Results | one one-shot `takeResult()` | one one-shot result per subsystem |
+| Emergency stop | abort the one owner | abort every active subsystem |
+| Heading stamp | current yaw at completion | yaw at the chirp's arrival time, from the yaw history |
+
+The single `request()` gate, the single release path (`finish()`), and the rule that subsystems are private are the same in both. That is what keeps the safety properties.
+
+### 4.3 Subsystems
+
+| | Case 1 | Case 2 |
+|---|---|---|
+| Mic class | `MicOwnDsp`: runs the DSP in `update()` | `MicProxy`: sends commands and polls a link |
+| Mic traits | `blocksCpu = true`, `abortable = false` | `blocksCpu = false`, `abortable = true` |
+| Mic `update()` cost | seconds | microseconds |
+| Deadline and watchdog | checked inside the DSP loops | handled by the superstructure; the DSP board has its own timeout |
+| Failure modes | a hang (watchdog resets the chip) | link down or DSP board dead (heartbeat check returns `FAIL`) |
+| `COMPUTE_TDOA` | cross-correlates the stored capture | converts the TDOA the DSP already sent: cheap local math |
+| New things to build | nothing | link protocol (framing, CRC, heartbeat), clock sync |
+| Speaker and Chassis | unchanged | unchanged |
+
+### 4.4 What stays the same
+
+- The layering and the `Subsystem` contract: `start`, `update`, `abort`, `isIdle`, `forceIdle`.
+- The `Step` fields and the `Context`.
+- The failure policies and the retry behavior.
+- Speaker and Chassis, including the gyro-based `TURN`.
+- The `loop()`: `feedWatchdog(); sup.update(); seq.update();`.
+
+### 4.5 Case 1 is a special case of Case 2
+
+The Case 2 superstructure and sequencer also run the Case 1 robot. Swap `MicProxy` for `MicOwnDsp` (traits `blocksCpu = true`) and the derived rule makes the Mic conflict with the Chassis (`needsRealtime`). Then:
+
+- `activeMask_` can never hold more than one real subsystem for the Mic or Chassis.
+- A group such as `LISTEN_CHIRP || TURN` is rejected as `CONFLICT` when the sequence is first requested, which is the right outcome.
+- The Mic runs blocking in the "blocking last" pass, so nothing real-time is active beside it.
+
+So the build order can be: write Case 2's structure once, run it with `MicOwnDsp` on a single Teensy, and move to `MicProxy` when the DSP board exists. The only changes are the Mic class and its traits.
+
+---
+
+## 5. Pitfalls and checklist
+
+1. **Keep the acoustic table symmetric.** If the speaker conflicts with the mic, the mic must conflict with the speaker. A one-sided entry gives different results depending on which request comes first.
+2. **Overlap needs timestamps.** The TDOA angle belongs to the heading when the chirp arrived. Without the yaw history and the DSP-to-local clock mapping, the bearing is wrong whenever the robot is moving.
+3. **Branches in a group write different `Context` fields.** Two branches writing the same field is a race.
+4. **Measure `maxUpdateUs` per subsystem** and keep it in the log. It tells you whether `blocksCpu` is really true for a subsystem, and whether a chunked algorithm is short enough to be treated as non-blocking.
+5. **Do not trust a blocking `update()` to be interruptible.** A `blocksCpu` subsystem must check its own deadline and feed the hardware watchdog inside its loops. The superstructure cannot act while it is inside `update()`.
+6. **Test motor noise against the chirp** before removing acoustic conflicts. A matched filter gives processing gain, so detection through motor noise is plausible, but it depends on your motors and chirp level.
+7. **Link health is a new failure mode in Case 2.** Heartbeat, CRC, and a timeout on every DSP request are required, and the DSP board should end its own work if the main Teensy goes silent.
+8. **STOP while moving.** In Case 2 the Mic can be listening for AFSK during a `TURN`, so a `STOP` can now arrive mid-turn. Decide the preemption policy: normally `emergencyStop()` and `FAILED`.
+
+
+
+---
+
+## Q9: What does "all end here, so the settle timer always starts and the hardware is always left safe" in finish() mean?
+
+> Success, timeout, failure, and emergency stop all end here, so the settle timer always starts and the hardware is always left safe.
+>
+> what this mean?
+
+### A
+
+It means every way a primitive can end goes through one function, `finish()`, so the cleanup happens the same way every time and can't be skipped.
+
+#### "All end here"
+
+A primitive can end in four ways:
+
+| Ending | Triggered by |
+|---|---|
+| Success | the subsystem's `update()` returns `SUCCESS` |
+| Timeout | the deadline passes before it finishes |
+| Failure | the subsystem's `update()` returns `FAIL` (for example, no gyro data) |
+| Emergency stop | `emergencyStop()` is called |
+
+All four end by calling `finish(result)`. There is no other code that releases the subsystem. The alternative is having cleanup written in several places (one in the timeout code, one in the e-stop code, and so on), where it is easy to forget a step in one of them. A forgotten step in the timeout path, for example, could leave a motor running.
+
+#### What `finish()` does
+
+```cpp
+void Superstructure::finish(Result r) {
+  if (owner_ != Owner::NONE) {
+    Subsystem* sub = sub_[idx(owner_)];
+    if (r != Result::SUCCESS) sub->abort();      // 1. stop the hardware if it ended abnormally
+    sub->forceIdle();                            // 2. force the subsystem to IDLE
+    settleUntil_ = millis() + settleMsAfter(owner_);   // 3. start the quiet period
+    lastOwner_   = owner_;
+  }
+  owner_      = Owner::NONE;                     // 4. give up ownership
+  busy_       = false;
+  lastResult_ = r;                               // 5. record the result for the sequencer
+}
+```
+
+#### "The hardware is always left safe"
+
+Steps 1 and 2. Take a `TURN` that times out because the gyro stopped responding. The chassis subsystem is still in `TURNING` with the motors running. `finish(TIMEOUT)` calls `abort()` and then `forceIdle()`, which sets both motors to 0 and the state to `STOPPED`. The robot never keeps spinning because a step ended badly.
+
+#### "The settle timer always starts"
+
+Step 3. After a subsystem releases, a quiet period begins. Motors and the speaker leave behind vibration noise and ringing, and the mic should not start listening until they die down. Because the timer starts inside `finish()`, it starts after a success, a timeout, a failure, and an e-stop alike. You can't get a path that releases the chassis without starting the 300 ms wait.
+
+#### One correction to the sentence
+
+"Always starts" is slightly too strong:
+
+- The timer only starts for an owner with a nonzero settle time. The Mic's settle time is 0, so releasing the Mic starts no quiet period.
+- It doesn't start for owner-less steps like `WAIT`, since there is nothing to settle.
+- In the Case 2 design, the quiet period applies only to subsystems that conflict with the one that released. For example, after the chassis stops, only the Mic is held back.
+
+A more exact statement would be: "every ending goes through the same release code, which forces the hardware safe and starts the quiet period for any subsystem that needs one."
+
+---
+
+## Q10: Rewrite the Case 1 state diagram. What do `--`, `-->` and `|` mean?
+
+> Rewrite this. I cannot distinguish what `--` means and what `-->` means and `|` means.
+>
+> ```
+> IDLE --request--> ACTIVE --finish--> SETTLING | IDLE
+> SETTLING --timer expires--> IDLE
+> ```
+
+### A
+
+The original notation was ambiguous, and I never defined it. Here is what each symbol was meant to say, followed by a clearer version.
+
+- `A --event--> B` means "when in state A and the event happens, move to state B". The `--` and `-->` were just the two ends of one arrow with a label in the middle.
+- `|` meant "or". `SETTLING | IDLE` means the next state is one of the two, depending on a condition I didn't write down.
+
+#### Rewritten as a table
+
+| From state | Event | Condition | To state |
+|---|---|---|---|
+| `IDLE` | `request()` is accepted | none | `ACTIVE` |
+| `ACTIVE` | `finish()` runs (success, timeout, failure, or e-stop) | the step that just ended has a settle time above 0 (Chassis 300 ms, Speaker 150 ms) | `SETTLING` |
+| `ACTIVE` | `finish()` runs | the settle time is 0 (Mic, or a `WAIT` / `COMPUTE_BEARING` step) | `IDLE` |
+| `SETTLING` | the settle timer expires | none | `IDLE` |
+| `SETTLING` | `request()` is accepted | only for the same subsystem that just released, or for an internal step | `ACTIVE` |
+
+The last row was missing from the original diagram. It is the case where a turn is followed by a drive with no waiting.
+
+#### As a diagram
+
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE
+    IDLE --> ACTIVE: request() accepted
+    ACTIVE --> SETTLING: finish(), settle time > 0
+    ACTIVE --> IDLE: finish(), settle time = 0
+    SETTLING --> IDLE: settle timer expires
+    SETTLING --> ACTIVE: request() for same subsystem or internal step
+```
+
+In plain words: the superstructure is idle until it accepts a request, and then it is active. When the step ends, it either goes back to idle or waits out a quiet period first, depending on which subsystem just finished. During the quiet period it still accepts a request for the same subsystem, but refuses one for a different subsystem until the timer expires.
+
+---
+
+## Q11: Case 2 (dedicated DSP core, Mic is long-in-wait): draw the same state diagram
+
+> What about Case 2: dedicated DSP core, Mic is long-in-wait? Can you draw the same state diagram?
+
+### A
+
+In Case 2 there is no single state diagram for the whole superstructure, because the global `IDLE` / `ACTIVE` / `SETTLING` state no longer exists. The state is the set of subsystems that are active, plus a settle timer for each subsystem. The diagram below is the state machine for **one subsystem**, and the Speaker, the Mic, and the Chassis each run their own copy.
+
+#### Per-subsystem state machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE
+    IDLE --> ACTIVE: requestGroup() accepted
+    ACTIVE --> IDLE: finish()
+    IDLE --> QUIET: conflicting subsystem finished, settle > 0
+    QUIET --> IDLE: timer expires
+```
+
+States:
+
+| State | Meaning |
+|---|---|
+| `IDLE` | free to accept a request |
+| `ACTIVE` | running a step |
+| `QUIET` | refuses requests until the timer expires |
+
+#### Transition table
+
+| From | Event | Condition | To |
+|---|---|---|---|
+| `IDLE` | `requestGroup()` accepted | no conflicting subsystem is active, this subsystem is not quiet | `ACTIVE` |
+| `ACTIVE` | `finish()` (success, timeout, failure, abort, or e-stop) | none | `IDLE` |
+| `IDLE` | a **conflicting** subsystem calls `finish()` | its settle time is above 0 | `QUIET` |
+| `QUIET` | settle timer expires | none | `IDLE` |
+| `QUIET` | another conflicting subsystem finishes | its settle time ends later than the current timer | `QUIET` (timer extended) |
+
+`QUIET` has no arrow to `ACTIVE`. A request for a quiet subsystem is refused with `SETTLING`, and the sequencer asks again on the next pass.
+
+#### What differs from Case 1
+
+- **Settle moved from the whole robot to individual subsystems.** In Case 1 a global `SETTLING` state blocked every other subsystem. In Case 2 only the subsystems that conflict with the one that just released become `QUIET`.
+- **A subsystem never goes quiet because of its own release.** After a `TURN`, the Chassis returns straight to `IDLE`, so a following `DRIVE` starts at once. Case 1 needed a special exemption for this.
+- **With the default conflict table, the Chassis finishing makes nothing quiet.** The Chassis doesn't conflict with the Mic in that table, so a `TURN` ends and the Mic can start immediately. Only the Speaker finishing makes the Mic `QUIET` (150 ms). If you add the motor-noise conflict, the Mic also goes `QUIET` for 300 ms after the Chassis stops.
+- **`SUB_INT` (`WAIT`, `COMPUTE_BEARING`) only has `IDLE` and `ACTIVE`.** It conflicts with nothing, so nothing makes it quiet.
+
+#### The robot-level view
+
+The old global states are now just what the active mask says:
+
+| Mask | Meaning |
+|---|---|
+| empty | nothing running (old `IDLE`) |
+| `MIC` | listening only |
+| `MIC` + `CHASSIS` | listening while turning (new in Case 2) |
+| `SPEAKER` + `CHASSIS` | transmitting while driving (allowed) |
+| `SPEAKER` + `MIC` | never allowed (conflict) |
+
+#### Example timeline: `LISTEN_CHIRP` + `TURN`, then `SEND_AFSK`
+
+| Time | Event | Mic | Chassis | Speaker |
+|---|---|---|---|---|
+| 0 ms | group `LISTEN_CHIRP \|\| TURN` accepted | `ACTIVE` | `ACTIVE` | `IDLE` |
+| 2100 ms | chirp heard, Mic finishes; `DEADLINE` join aborts the turn | `IDLE` | `IDLE` (via abort) | `IDLE` |
+| 2150 ms | `SEND_AFSK` accepted | `IDLE` | `IDLE` | `ACTIVE` |
+| 2200 ms | a `LISTEN_AFSK` request arrives | refused (`BUSY`: it conflicts with the active Speaker) | `IDLE` | `ACTIVE` |
+| 2650 ms | Speaker finishes | `QUIET` (150 ms) | `IDLE` | `IDLE` |
+| 2800 ms | quiet timer expires | `IDLE` | `IDLE` | `IDLE` |
+
 
