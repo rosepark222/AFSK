@@ -1898,4 +1898,29 @@ The old global states are now just what the active mask says:
 | 2650 ms | Speaker finishes | `QUIET` (150 ms) | `IDLE` | `IDLE` |
 | 2800 ms | quiet timer expires | `IDLE` | `IDLE` | `IDLE` |
 
+---
 
+## Q12: Is `QUIET` in Case 2 the same as `SETTLING` in Case 1?
+
+> Is QUITE in case 2 same as SETTLING in case 1?
+
+### A
+
+Yes, they are the same concept: a quiet period after a subsystem releases, during which listening or other conflicting work is held off. The difference is the scope. I also used two names for one idea, which I should not have done. The refusal reason in the Case 2 code is already called `SETTLING`, so I'd use `SETTLING` in both cases and drop `QUIET`.
+
+| | Case 1 `SETTLING` | Case 2 `QUIET` (better named `SETTLING`) |
+|---|---|---|
+| Scope | one global state for the whole robot | one state per subsystem |
+| Who is blocked | any subsystem other than the one that just released | only subsystems that conflict with the one that released |
+| How you enter it | from `ACTIVE`, when the owner finishes | from `IDLE`, when a different (conflicting) subsystem finishes |
+| What the finished subsystem does | goes into `SETTLING` itself, but is exempt from the block | goes straight to `IDLE`, so no exemption is needed |
+| What it blocks | `request()` for another subsystem | `requestGroup()` for that subsystem |
+| Ends when | the global timer expires | that subsystem's own timer expires |
+| Can several run at once? | no, there is one timer | yes, one timer per subsystem, and they can overlap |
+
+An example of the difference. After the Speaker finishes:
+
+- **Case 1:** the whole robot is `SETTLING` for 150 ms. A `TURN` request for the Chassis is refused, even though a turn doesn't care about speaker ring-down.
+- **Case 2:** only the Mic is `SETTLING` for 150 ms, because the Mic is the subsystem that conflicts with the Speaker. The Chassis can start immediately.
+
+Case 1 only needs a global timer because it runs one subsystem at a time and has no conflict rules. Case 2 can be more precise because it has the conflict rules. In Case 2, the rule for "who has to wait" comes from the conflict table, and the rule for "how long" comes from the settle time of the subsystem that just released.
