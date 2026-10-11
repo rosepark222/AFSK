@@ -291,3 +291,67 @@ void loop() {
 4. Add deadline checks inside every long loop, plus the hardware watchdog.
 5. Move heavy computation to a chunked or background form only when the numbers call for it.
 6. Start with a blocking version of one primitive (for example `TURN`), get it working on the robot, then convert it to `request()`/`update()` and compare. Doing it once by hand teaches more than a diagram.
+
+
+
+
+
+---
+
+## Q: Offloading DSP to a second Teensy: long-in-time becomes long-in-wait
+
+> You have explained the difference in two kinds of "long":
+> 2.1 Long in waiting time (long-in-wait)
+> 2.2 Long in computing time (long-in-time)
+>
+> `LISTEN_CHIRP` is a long-in-time task.
+> If I have a dedicated DSP machine (a secondary Teensy), I can convert it to long-in-wait.
+> Then, I can do true request/update and interleave multiple tasks, such as `LISTEN_CHIRP` and `TURN`.
+> In that sense, update is: update the subsystem state which is working on long-in-wait tasks.
+
+### A
+
+Yes. This is the same move FRC makes with a vision coprocessor: moving the computation to another processor turns a long-in-time task into a long-in-wait task from the main Teensy's point of view. Its `update()` then only has to poll for a result, which is cheap.
+
+And `update()` means what you said: advance the state of each subsystem that is working on a long-in-wait task. It never does the heavy work itself. The work happens in the motors, the DMA audio, or the DSP Teensy, and `update()` checks on it.
+
+#### What changes
+
+**1. The Mic becomes a proxy for the DSP Teensy.** The DSP Teensy owns the microphones, and the main Teensy only sends commands and reads results over UART or SPI:
+
+```cpp
+Result Mic::update() {
+  while (link.available()) parser.feed(link.read());     // cheap byte parsing
+
+  switch (st_) {
+    case WAITING:
+      if (parser.hasChirpResult()) { fill ctx (timing, tdoa); return Result::SUCCESS; }
+      if (!parser.heartbeatOk())   return Result::FAIL;  // DSP board died or went silent
+      break;
+  }
+  return Result::RUNNING;                                // every call is microseconds
+}
+```
+
+You now need a small protocol: `START_LISTEN_CHIRP`, `ABORT`, `RESULT`, a CRC, and a heartbeat so a dead DSP board is detected.
+
+**2. The exclusion rule splits into two causes.** There were two reasons for "one subsystem at a time", and offloading removes only one:
+
+- **CPU contention:** this goes away with the second Teensy.
+- **Acoustic contention:** this stays. The speaker deafens the mics, and motor noise can mask a chirp.
+
+So the single `owner_` becomes a conflict matrix:
+
+| | Speaker | Mic | Chassis |
+|---|---|---|---|
+| **Speaker** | | conflict | allowed |
+| **Mic** | conflict | | conflict, unless motor noise is tolerable |
+| **Chassis** | allowed | conflict | |
+
+Under the strict acoustic rule, the only new combination you get is Speaker + Chassis. Your `LISTEN_CHIRP` + `TURN` example works only if the DSP can find the chirp through motor noise. A matched filter has processing gain, so this is plausible, and you can test it.
+
+**3. `request()` checks conflicts, not a single owner.** Replace `owner_` with an `activeMask_`. A request is accepted if the new subsystem doesn't conflict with any active one.
+
+**4. The sequencer needs a way to overlap steps.** One active step at a time can't interleave anything. You need either a parallel group (start `LISTEN_CHIRP` and `TURN` together, finish when both finish, like WPILib's `ParallelCommandGroup`) or separate start and await steps.
+
+**5. Measurements must be timestamped.** If you listen while turning, the TDOA angle is relative to the heading at the moment the chirp arrived, not the heading when the primitive ended. The main Teensy should keep a short history of gyro yaw, and the DSP's detection time must be mapped to the main Teensy's clock. Otherwise the bearing calculation will be wrong.
