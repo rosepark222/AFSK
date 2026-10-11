@@ -293,7 +293,86 @@ void loop() {
 6. Start with a blocking version of one primitive (for example `TURN`), get it working on the robot, then convert it to `request()`/`update()` and compare. Doing it once by hand teaches more than a diagram.
 
 
+---
 
+## Q: `request()`/`update()` vs. blocking `run()`: explained for a new engineer
+
+> `request()`/`update()` architecture is common in FRC superstructure design? What is the difference between `request()`/`update()` and execute() design? I am new to this SW planning. Can you explain to a new engineer?
+
+### A
+
+Yes, `request()`/`update()` is the common pattern in FRC. Here is the explanation again, adjusted for what we've worked out since.
+
+#### Two ways to run a task that takes time
+
+Take "turn 90°", which takes about 2 seconds.
+
+**Blocking (run to completion).** The code stays inside one function until the task is done:
+
+```cpp
+void turn90() {
+  while (!reachedTarget()) {   // stays here for 2 seconds
+    readGyro();
+    setMotors();
+  }
+}
+```
+
+While it runs, nothing else in your program runs.
+
+**Non-blocking (`request()` / `update()`).** Starting the task and doing the work are separate. You start it once, then `update()` is called over and over, and each call does one small step and returns:
+
+```cpp
+turn.request(90);        // set the goal, return immediately
+
+void loop() {
+  turn.update();         // read gyro, adjust motors, return in microseconds
+  // ...other code gets to run here
+}
+```
+
+Cooking analogy: blocking is standing at the oven staring until the food is done. Non-blocking is setting a timer, doing other things, and checking the oven now and then.
+
+#### Why FRC uses non-blocking
+
+An FRC robot has to drive, run an arm, run a shooter, read joysticks, and keep the field watchdog fed, all at once. If one mechanism blocked for 2 seconds, everything else would freeze. So WPILib calls every subsystem's `periodic()` every 20 ms, and each call does a tiny slice of work.
+
+| FRC concept | Your robot |
+|---|---|
+| Subsystem `periodic()` | `Subsystem::update()` |
+| Superstructure (state machine coordinating subsystems) | Superstructure |
+| Set a goal / schedule a command | `request()` |
+| Scheduler loop (20 ms) | `loop()` calling `update()` |
+| `SequentialCommandGroup` | Sequencer |
+
+In WPILib's command-based framework, a command has `initialize()`, `execute()`, `isFinished()` and `end()`. Its `execute()` is called repeatedly and never blocks. If you see "execute()" in this thread's blocking version, it was a different meaning of the word, so don't carry the name over. Use `run()` for a blocking version.
+
+#### What `update()` really means
+
+`update()` advances the state of a subsystem that is working on a task. It never does the heavy work itself. The work happens somewhere else (motors, DMA audio, a second processor), and `update()` checks on it. This is the "long-in-wait" idea: the task may last seconds, but each check takes microseconds.
+
+If the work is "long-in-time" (heavy DSP on the same CPU), then `update()` either has to run that work (and block for a while) or you have to move it elsewhere.
+
+#### The trade-off
+
+| | `request()`/`update()` | Blocking `run()` |
+|---|---|---|
+| Code complexity | Higher: each task is a state machine | Lower: reads like a normal function |
+| Do other things during a task | Yes | No |
+| Abort or interrupt a task | Easy | Hard: needs flags or interrupts |
+| Add concurrent features later | Easy | Each one needs rework |
+| Debugging | Harder: reason about state between calls | Easier: code order is execution order |
+
+Non-blocking costs complexity, and what you buy with it is concurrency. If you never need concurrency, you are paying for something you don't use.
+
+#### Which fits your robot?
+
+- **Today (one Teensy, one active subsystem at a time):** blocking is a valid, simpler choice for the Mic's DSP. Keeping the `request()`/`update()` API between layers is still good practice, because it lets each primitive do as much work as it needs inside `update()`.
+- **With a second Teensy doing the DSP:** `request()`/`update()` becomes the natural fit, because `LISTEN_CHIRP` turns into a cheap poll and can overlap with `TURN`, subject to the acoustic conflicts we discussed.
+
+#### Advice for starting out
+
+Write the blocking version of one primitive, such as `TURN`, and get it working on the robot. Then convert it to `request()`/`update()` and see what you gain and lose. Doing it once by hand teaches more than any diagram.
 
 
 ---
@@ -307,7 +386,7 @@ void loop() {
 > `LISTEN_CHIRP` is a long-in-time task.
 > If I have a dedicated DSP machine (a secondary Teensy), I can convert it to long-in-wait.
 > Then, I can do true request/update and interleave multiple tasks, such as `LISTEN_CHIRP` and `TURN`.
-> In that sense, update is: update the subsystem state which is working on long-in-wait tasks.
+> In that sense, update is: *update the subsystem state which is working on long-in-wait tasks*.
 
 ### A
 
