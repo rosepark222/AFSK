@@ -628,3 +628,115 @@ Result Superstructure::takeResult() {
 5. **Heading stamp.** After a successful `COMPUTE_TDOA`, the superstructure records the chassis yaw in the context. `computeBearing()` uses these headings to combine the two TDOA angles and resolve the front/back ambiguity.
 6. **Settle time and Robot B's cycle.** The settle delay adds to Robot B's 0.7 s chirp plus 2.3 s listen cycle. If you need exactly 3 s, shorten `SETTLE_SPEAKER_MS` or subtract it from the listen window.
 
+
+
+---
+
+## Q: Does concurrent `LISTEN_CHIRP` + `TURN` change the superstructure state definition?
+
+> If robot can do `LISTEN_CHIRP` and `TURN` at the same time, would you change the superstructure state definition?
+>
+> Superstructure states
+> Since only one subsystem can be active at a time, the superstructure is essentially an arbiter that owns a single "who has the floor" state. Suggested states:
+>
+> | Superstructure state | Active subsystem | Purpose |
+> |---|---|---|
+> | IDLE | none | Waiting for a trigger |
+> | LISTENING | Mic | Waiting for chirp or AFSK |
+> | LOCALIZING | Mic (compute) | TDOA calculation on the captured chirp |
+> | DECODING_MESSAGE | Mic | AFSK demod and parse |
+> | EXECUTING_COMMAND | Depends on command | Dispatch to a sub-sequence |
+> | MOVING | Chassis | Drive or turn |
+> | TRANSMITTING_CHIRP | Speaker | Send chirp |
+> | TRANSMITTING_MSG | Speaker | Send AFSK (command, ACK, etc.) |
+> | SENDING_ACK | Speaker | Priority transmit of an ACK (can be a variant of TRANSMITTING_MSG) |
+> | ERROR | none | Safe stop, recover to IDLE or LISTENING |
+
+### A -- conflict matrix is needed
+
+Yes, I would change it. The "who has the floor" state only works when exactly one subsystem can be active. Once `LISTEN_CHIRP` and `TURN` can overlap, that single state can no longer describe the robot.
+
+#### What breaks
+
+The old table mixes two kinds of things:
+
+- **Subsystem activities:** `LISTENING`, `LOCALIZING`, `DECODING_MESSAGE` (Mic), `MOVING` (Chassis), `TRANSMITTING_*` (Speaker).
+- **Whole-robot conditions:** `IDLE`, `ERROR`.
+
+With one active subsystem, the two kinds can share one enum. With concurrency you would need combined values like `LISTENING_AND_MOVING`, and every new allowed combination adds more. That is state explosion, and it is the signal that you have merged things that should be separate.
+
+#### What replaces it
+
+Split the state into two levels:
+
+1. **Each subsystem keeps its own state machine.** The old activity states move down into them.
+2. **The superstructure state becomes the set of active subsystems, plus a health state.** Instead of one enum value, it is an `activeMask_` and a short list of robot-level states.
+
+| Level | States | Notes |
+|---|---|---|
+| **Mic subsystem** | `IDLE`, `LISTENING`, `LOCALIZING`, `DECODING` | The old LISTENING / LOCALIZING / DECODING_MESSAGE |
+| **Chassis subsystem** | `STOPPED`, `TURNING`, `DRIVING`, `FAULT` | The old MOVING, split by action |
+| **Speaker subsystem** | `IDLE`, `SENDING_CHIRP`, `SENDING_AFSK` | The old TRANSMITTING_CHIRP / MSG / SENDING_ACK (an ACK is just an AFSK with priority) |
+| **Superstructure** | `IDLE` (mask empty), `ACTIVE` (mask not empty), `ERROR` / `ESTOP` | Plus the `activeMask_` and a conflict rule |
+
+`EXECUTING_COMMAND` was never a real robot state. It is dispatch logic, so it moves into the sequencer or command handler. `SETTLING` also changes, as described below.
+
+With this split, "listening while turning" is not a new state. It is simply `activeMask_ = MIC | CHASSIS`, with the Mic in `LISTENING` and the Chassis in `TURNING`.
+
+#### The rule changes from one owner to a conflict matrix
+
+The single-owner check becomes "does the new subsystem conflict with any active one?":
+
+| | Speaker | Mic | Chassis |
+|---|---|---|---|
+| **Speaker** | | conflict | allowed |
+| **Mic** | conflict | | allowed only if the chirp survives motor noise |
+| **Chassis** | allowed | depends | |
+
+```cpp
+enum Sub : uint8_t { SPK = 1 << 0, MIC = 1 << 1, CHS = 1 << 2 };
+
+// Must be symmetric: if A conflicts with B, then B conflicts with A.
+static uint8_t conflictsWith(Sub s) {
+  switch (s) {
+    case SPK: return MIC;      // speaker deafens the mics
+    case MIC: return SPK;      // add "| CHS" if motor noise masks the chirp
+    case CHS: return 0;        // add "| MIC" under the strict rule
+  }
+  return 0;
+}
+
+bool Superstructure::request(const Step& s, Context* ctx) {
+  Sub need = subFor(s.prim);
+  if (activeMask_ & need)                 return false;   // that subsystem is already busy
+  if (activeMask_ & conflictsWith(need))  return false;   // acoustic conflict
+  if (settleBlocks(need))                 return false;   // per-subsystem quiet timer
+  activeMask_ |= need;
+  sub(need)->start(s, ctx);
+  return true;
+}
+```
+
+The matrix is data. If a test shows the Mic can hear chirps over motor noise, you remove one entry, and no state definitions change.
+
+#### Other things that change
+
+- **Settle is no longer a global state.** After the Speaker releases, only the Mic needs a quiet period, not the Chassis. Keep a timer per subsystem, such as `micBlockedUntil_`, and check it in `settleBlocks()`.
+- **Results become per subsystem.** `takeResult()` becomes `takeResult(Sub)`. Two primitives can finish at different times, and `finish()` clears only its own bit from the mask.
+- **The sequencer needs a join.** Starting `LISTEN_CHIRP` and `TURN` together requires a parallel step: the group finishes when both finish, and you must choose what a failure of one does to the other (usually abort the other). This is WPILib's `ParallelCommandGroup`.
+- **Emergency stop gets simpler and more important.** It aborts every active subsystem, clears the whole mask, and forces the chassis to stop. The `ERROR` state is the robot-level result.
+- **Hearing commands while moving becomes possible.** If the Mic is listening for AFSK during a `TURN`, a `STOP` can now arrive mid-turn, so preemption stops being hypothetical.
+- **Measurements need timestamps.** A TDOA angle taken during a turn must be paired with the heading at the moment of arrival, not the heading when the primitive finished.
+
+#### Summary
+
+| Before | After |
+|---|---|
+| One enum: who has the floor | `activeMask_` plus one state machine per subsystem |
+| States like `MOVING`, `LISTENING` in the superstructure | Those are subsystem states |
+| Single `owner_` | Conflict matrix (data, not code) |
+| Global `SETTLING` | Per-subsystem quiet timers |
+| One result | One result per subsystem, plus a join in the sequencer |
+
+If you plan to add the second Teensy, I'd make this change at the same time, since both depend on the same idea: subsystems run independently, and the superstructure only decides what may overlap.
+
