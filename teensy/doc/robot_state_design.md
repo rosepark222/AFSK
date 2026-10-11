@@ -1924,3 +1924,49 @@ An example of the difference. After the Speaker finishes:
 - **Case 2:** only the Mic is `SETTLING` for 150 ms, because the Mic is the subsystem that conflicts with the Speaker. The Chassis can start immediately.
 
 Case 1 only needs a global timer because it runs one subsystem at a time and has no conflict rules. Case 2 can be more precise because it has the conflict rules. In Case 2, the rule for "who has to wait" comes from the conflict table, and the rule for "how long" comes from the settle time of the subsystem that just released.
+
+
+---
+
+## Q13: Why does the Mic enter `SETTLING` when the Speaker finishes? It looks like the conflict is resolved
+
+> You said: When the Speaker (a conflicting subsystem) calls `finish()`, the Mic enters `SETTLING`. This is somewhat counter intuitive because it looks like the conflict is resolved (Speaker is done).
+
+### A
+
+You're right. A state that starts when the conflict ends looks backwards, and the name `SETTLING` hides what is going on. There are two different reasons the Mic can be refused, and the code treats them as one idea.
+
+| Phase | Why the Mic is refused | Refusal returned | Mic's state |
+|---|---|---|---|
+| While the Speaker is `ACTIVE` | the Speaker is transmitting right now, a logical conflict | `BUSY` | `IDLE` |
+| After the Speaker finishes | the speaker's sound is still in the air (ring-down, echoes), a physical aftereffect | `SETTLING` | `SETTLING` |
+
+When the Speaker finishes, the logical conflict is over, but the effect of the conflict is not. Starting a listen at that moment would let the Mic hear the tail of the speaker's own output and possibly report it as a chirp. So the second phase is not "still in conflict". It is "the air isn't quiet yet".
+
+The name is misleading because the thing settling is the room, not the Mic. The Mic is just the subsystem that has to wait. In the code, the timer is started by the subsystem that caused the disturbance (the Speaker's 150 ms) but enforced on the subsystem that would be harmed (the Mic). That crossing is what makes the state look odd.
+
+#### A better name
+
+Sonar and radar call this a holdoff or blanking interval: a period after a transmission when the receiver is ignored on purpose. I'd rename it:
+
+| Now | Better |
+|---|---|
+| `SlotState::SETTLING` | `SlotState::HOLDOFF` |
+| `Refusal::SETTLING` | `Refusal::HOLDOFF` |
+| `settleMsAfter()` | `holdoffMsAfter()` |
+| `settleUntil` | `holdoffUntil` |
+| `SETTLE_SPEAKER_MS` / `SETTLE_CHASSIS_MS` | `HOLDOFF_AFTER_SPEAKER_MS` / `HOLDOFF_AFTER_CHASSIS_MS` |
+
+The constant names matter most, because they say whose output you are waiting out. `SETTLE_SPEAKER_MS` reads as "the speaker settles", which is part of the confusion. `HOLDOFF_AFTER_SPEAKER_MS` says what it is.
+
+The state diagram wording changes the same way:
+
+```
+IDLE --conflicting subsystem finished--> HOLDOFF --timer expires--> IDLE
+```
+
+#### An alternative model
+
+You could drop the state and keep only a timestamp, `blockedUntil`, checked in `requestGroup()`. The Mic would then be `IDLE` and also "blocked until time T", which is honest about it being a guard, not a mode. I kept it as a state so it shows up in `dumpStates()` and in the per-subsystem diagram. The cost is exactly the confusion you ran into. Both are valid, and the timestamp version has one fewer state to explain.
+
+If you'd like, I can apply the rename (state, refusal, constants, comments, and the diagram text in the markdown notes) to `robot_all_in_one_case2.cpp`.
