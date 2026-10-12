@@ -1,3 +1,27 @@
+## Q&A: Command Sources in FRC/Robot Architecture
+--- 
+### Q 
+teensy/doc/seq_sup_sub_case2.cpp calls sup.requestGroup from two requestors -- Sequencer.update and requestUserStep (onUserCommand). 
+Does the robot code have two sources for the requestor—one from user input and the other from the sequencer?
+
+### A 
+Yes, exactly! In this architecture (as implemented in [seq_sup_sub_case2.cpp](https://github.com/rosepark222/AFSK/blob/main/teensy/doc/seq_sup_sub_case2.cpp#L615)), the system has **two distinct command sources** that both feed into the exact same safety gate:
+
+#### 1. The Two Request Sources
+* **The Autonomous Sequencer (`Sequencer`):** 
+  * Automatically walks through a predefined script table of steps (e.g., listening for chirps, turning, driving, or sending AFSK packets).
+  * Calls `sup.requestGroup()` to drive the robot through its programmed routine.
+* **Manual User Input (`onUserCommand()` / Serial):** 
+  * Listens to incoming characters from the serial monitor (such as pressing `t` to turn, `d` to drive, or `x` for an emergency stop).
+  * Wraps the input into a `Step` and calls `requestUserStep()`, which routes through `sup.requestGroup()`.
+
+#### 2. The Unified Safety Gate (`Superstructure`)
+Both sources must pass through the **Superstructure's** `requestGroup()` method. This ensures that whether a command comes from the autonomous script or human keyboard input, it is handled with identical safety rules:
+* **Atomic Validation:** Checks whether the required subsystems (Speaker, MicProxy, or Chassis) are available all at once.
+* **Conflict & Settling Protection:** Enforces acoustic conflict tables and active settle timers to prevent manual commands from overriding or crashing a running routine without proper checks.
+
+
+
 ## Things to improve for seq_sup_sub_case2.cpp which is a sup/sub/seq assuming dedicated DSP -- handle heavy work and main cpu can poll its state. 
 
 ## Q: Can a subsystem change its own state, instead of the superstructure changing it?
