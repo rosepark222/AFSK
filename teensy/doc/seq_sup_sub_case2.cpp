@@ -1011,6 +1011,109 @@ static const Step SEQ[] = {
 #endif
 
 // ============================================================================
+// MANUAL USER COMMANDS
+// Serial input: 't' = turn left 90 degrees, 'd' = drive forward 1 foot,
+// 'x' = emergency stop. Manual actions use the same requestGroup() safety gate
+// as sequencer actions; they do not call subsystem methods directly.
+// ============================================================================
+static bool manualActive = false;
+static Sub manualSub = SUB_NONE;
+static bool pendingUserStep = false;
+static Step queuedUserStep{};
+
+static bool userCharToStep(uint8_t ch, Step& out) {
+  switch (ch) {
+    case 't':
+    case 'T':
+      out = { Prim::TURN, 90.0f, 3000, OnFail::ABORT, 0 };
+      return true;
+    case 'd':
+    case 'D':
+      out = { Prim::DRIVE, 1.0f, 4000, OnFail::ABORT, 0 };
+      return true;
+    default:
+      return false;
+  }
+}
+
+static void requestUserStep(const Step& step, bool mayQueue) {
+  if (manualActive) {
+    Serial.println("[user] A manual command is already running; command refused.");
+    return;
+  }
+
+  Sub granted[1] = { SUB_NONE };
+  Refusal why = sup.requestGroup(&step, 1, &ctx, granted);
+
+  if (why == Refusal::NONE) {
+    manualSub = granted[0];
+    manualActive = true;
+    pendingUserStep = false;
+    Serial.printf("[user] Command accepted: %s\n", PRIM_NAME[(int)step.prim]);
+  } else if (why == Refusal::BUSY || why == Refusal::SETTLING) {
+    if (mayQueue && !pendingUserStep) {
+      queuedUserStep = step;
+      pendingUserStep = true;
+      Serial.printf("[user] %s; command queued and will retry.\n",
+                    why == Refusal::BUSY ? "Subsystem busy" : "Subsystem settling");
+    } else {
+      Serial.printf("[user] Command not accepted (%s).\n",
+                    why == Refusal::BUSY ? "BUSY" : "SETTLING");
+    }
+  } else {
+    Serial.printf("[user] Command refused (%s).\n",
+                  why == Refusal::CONFLICT ? "CONFLICT" : "INVALID");
+  }
+}
+
+// Called for each serial character. All ordinary motion commands pass through
+// requestGroup(), which validates resource conflicts and settling intervals.
+static void onUserCommand(uint8_t rawInput) {
+  if (rawInput == '\r' || rawInput == '\n' || rawInput == ' ') return;
+
+  if (rawInput == 'x' || rawInput == 'X' || rawInput == '!') {
+    pendingUserStep = false;
+    manualActive = false;
+    Serial.println("[user] Emergency stop requested.");
+    seq.abort();
+    return;
+  }
+
+  Step userStep{};
+  if (!userCharToStep(rawInput, userStep)) {
+    Serial.printf("[user] Unknown command '%c'. Use t=turn, d=drive, x=stop.\n",
+                  (rawInput >= 32 && rawInput <= 126) ? rawInput : '?');
+    return;
+  }
+
+  if (pendingUserStep) {
+    Serial.println("[user] A command is already queued; new command ignored.");
+    return;
+  }
+  requestUserStep(userStep, true);
+}
+
+static void serviceUserCommands() {
+  // Report completion of a manually requested action. pollResult() is one-shot.
+  if (manualActive) {
+    Result r = sup.pollResult(manualSub);
+    if (r != Result::RUNNING) {
+      Serial.printf("[user] Manual action finished: %s\n", RESULT_NAME[(int)r]);
+      manualActive = false;
+      manualSub = SUB_NONE;
+    }
+  }
+
+  // Retry only transient refusals; requestUserStep() leaves the command queued
+  // if the gate still reports BUSY/SETTLING.
+  if (pendingUserStep && !manualActive) {
+    Step retry = queuedUserStep;
+    pendingUserStep = false;
+    requestUserStep(retry, true);
+  }
+}
+
+// ============================================================================
 // MAIN
 // ============================================================================
 static Superstructure sup;
@@ -1032,12 +1135,21 @@ void setup() {
 #endif
 
   seq.start();
+  Serial.println("[user] Ready: send t=turn left 90, d=drive 1 foot, x=emergency stop.");
 }
 
 void loop() {
   feedWatchdog();
-  sup.update();     // every subsystem advances; each update() is short
-  seq.update();     // decides the next group
+
+  // 1. Poll serial input every loop pass and route each character through
+  //    onUserCommand(). The command handler calls sup.requestGroup().
+  while (Serial.available() > 0) {
+    onUserCommand((uint8_t)Serial.read());
+  }
+
+  sup.update();              // advance every active subsystem
+  serviceUserCommands();     // poll manual results and retry BUSY/SETTLING requests
+  seq.update();              // autonomous sequencer also uses requestGroup()
 
 #if LOG_STATES
   static uint32_t lastDump = 0;
