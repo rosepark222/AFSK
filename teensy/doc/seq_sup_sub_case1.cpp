@@ -793,6 +793,84 @@ static Superstructure sup;
 static Sequencer      seq(sup);
 static Context        ctx{};
 
+// -----------------------------------------------------------------------------
+// Manual Serial commands. All actual work still goes through sup.request().
+// This version has ONE active subsystem at a time; there is no requestGroup().
+// -----------------------------------------------------------------------------
+static bool manualPending = false;
+static bool manualInFlight = false;
+static Step manualStep{};
+
+// 't' = turn left 90 degrees; 'd' = drive forward 1 foot; 'x' = emergency stop.
+static bool userCharToStep(char ch, Step& out) {
+  switch (ch) {
+    case 't':
+    case 'T':
+      out = { Prim::TURN, 90.0f, 3000, OnFail::ABORT, 0 };
+      return true;
+    case 'd':
+    case 'D':
+      out = { Prim::DRIVE, 1.0f, 4000, OnFail::ABORT, 0 };
+      return true;
+    default:
+      return false;
+  }
+}
+
+// A manual motion command preempts the autonomous sequence, then goes through
+// the Superstructure gate. Refused requests are retried by serviceUserCommands().
+static void onUserCommand(char ch) {
+  if (ch == '\r' || ch == '\n' || ch == ' ' || ch == '\t') return;
+
+  if (ch == 'x' || ch == 'X' || ch == '!') {
+    manualPending = false;
+    manualInFlight = false;
+    seq.abort();  // invokes sup.emergencyStop(); chassis motors are commanded off
+    Serial.println("[user] EMERGENCY STOP: sequence aborted, motors commanded off");
+    return;
+  }
+
+  Step requested{};
+  if (!userCharToStep(ch, requested)) {
+    if (ch == '?' || ch == 'h' || ch == 'H') {
+      Serial.println("Commands: t=turn left 90 deg, d=drive forward 1 ft, x=emergency stop, ?=help");
+    } else {
+      Serial.printf("[user] Unknown command '%c'. Type ? for help.\n", ch);
+    }
+    return;
+  }
+
+  // The sequencer and manual control share sup.takeResult(), so stop the
+  // sequencer before manual control takes ownership of that result channel.
+  seq.abort();
+  manualStep = requested;
+  manualPending = true;       // newest motion command replaces any pending one
+  manualInFlight = false;     // any previous manual action was preempted
+  Serial.printf("[user] Queued manual command: %s\n",
+                requested.prim == Prim::TURN ? "turn left 90 degrees" : "drive forward 1 foot");
+}
+
+// Call after sup.update(). A request can be refused during settling; retry it.
+// Since seq is FAILED after manual takeover, it will not consume manual results.
+static void serviceUserCommands() {
+  if (manualPending && !manualInFlight) {
+    if (sup.request(manualStep, &ctx)) {
+      manualPending = false;
+      manualInFlight = true;
+      Serial.printf("[user] Accepted by Superstructure: %s\n",
+                    manualStep.prim == Prim::TURN ? "TURN" : "DRIVE");
+    }
+  }
+
+  if (manualInFlight) {
+    Result r = sup.takeResult();
+    if (r != Result::RUNNING) {
+      Serial.printf("[user] Manual command finished: %s\n", RESULT_NAME[(int)r]);
+      manualInFlight = false;
+    }
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   pinMode(LED_BUILTIN, OUTPUT);
@@ -808,14 +886,26 @@ void setup() {
 #endif
 
   seq.start();
+  Serial.println("Robot ready. Serial commands: t=left 90 deg, d=forward 1 ft, x=stop, ?=help");
 }
 
 void loop() {
   feedWatchdog();
-  sup.update();     // advances the active primitive (a Mic primitive may run long inside this call)
-  seq.update();     // decides the next step
 
-  // Other command sources go through the same gate. Example hooks:
-  // if (digitalRead(ESTOP_PIN) == LOW) { seq.abort(); }          // e-stop button
-  // if (rxFrameReady()) { /* decode -> sup.request() or sup.emergencyStop() */ }
+  // 1) Read user input first so manual commands can preempt autonomous work.
+  while (Serial.available() > 0) {
+    onUserCommand((char)Serial.read());
+  }
+
+  // 2) Advance the currently active primitive / settling timer.
+  sup.update();
+
+  // 3) Start/retry manual work and collect its result through the same gate.
+  serviceUserCommands();
+
+  // 4) Advance the autonomous sequence. After manual takeover it stays FAILED.
+  seq.update();
+
+  // Other input sources should follow the same pattern: decode -> sup.request()
+  // for work, or sup.emergencyStop() for an emergency.
 }
