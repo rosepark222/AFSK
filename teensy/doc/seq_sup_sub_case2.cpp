@@ -1013,9 +1013,19 @@ static const Step SEQ[] = {
 // ============================================================================
 // MANUAL USER COMMANDS
 // Serial input: 't' = turn left 90 degrees, 'd' = drive forward 1 foot,
-// 'x' = emergency stop. Manual actions use the same requestGroup() safety gate
-// as sequencer actions; they do not call subsystem methods directly.
+// 'x' = emergency stop.
+//
+// Single execution path:
+//   onUserCommand() -> queue -> serviceUserCommands() -> requestUserStep()
+//                    -> sup.requestGroup()
+//
+// Ordinary manual commands do not preempt autonomous work. BUSY/SETTLING
+// requests remain queued and are retried by serviceUserCommands().
 // ============================================================================
+static Superstructure sup;
+static Sequencer      seq(sup);
+static Context        ctx{};
+
 static bool manualActive = false;
 static Sub manualSub = SUB_NONE;
 static bool pendingUserStep = false;
@@ -1027,20 +1037,21 @@ static bool userCharToStep(uint8_t ch, Step& out) {
     case 'T':
       out = { Prim::TURN, 90.0f, 3000, OnFail::ABORT, 0 };
       return true;
+
     case 'd':
     case 'D':
       out = { Prim::DRIVE, 1.0f, 4000, OnFail::ABORT, 0 };
       return true;
+
     default:
       return false;
   }
 }
 
-static void requestUserStep(const Step& step, bool mayQueue) {
-  if (manualActive) {
-    Serial.println("[user] A manual command is already running; command refused.");
-    return;
-  }
+// Called ONLY by serviceUserCommands(). It is the sole manual-command path
+// into the Superstructure resource gate.
+static void requestUserStep(const Step& step) {
+  if (manualActive) return;
 
   Sub granted[1] = { SUB_NONE };
   Refusal why = sup.requestGroup(&step, 1, &ctx, granted);
@@ -1049,39 +1060,40 @@ static void requestUserStep(const Step& step, bool mayQueue) {
     manualSub = granted[0];
     manualActive = true;
     pendingUserStep = false;
-    Serial.printf("[user] Command accepted: %s\n", PRIM_NAME[(int)step.prim]);
+    Serial.printf("[user] Command started: %s\n", PRIM_NAME[(int)step.prim]);
   } else if (why == Refusal::BUSY || why == Refusal::SETTLING) {
-    if (mayQueue && !pendingUserStep) {
-      queuedUserStep = step;
-      pendingUserStep = true;
-      Serial.printf("[user] %s; command queued and will retry.\n",
-                    why == Refusal::BUSY ? "Subsystem busy" : "Subsystem settling");
-    } else {
-      Serial.printf("[user] Command not accepted (%s).\n",
-                    why == Refusal::BUSY ? "BUSY" : "SETTLING");
-    }
+    // Keep the pending command; serviceUserCommands() retries next loop.
   } else {
+    // CONFLICT / INVALID are permanent refusals for this request.
+    pendingUserStep = false;
     Serial.printf("[user] Command refused (%s).\n",
                   why == Refusal::CONFLICT ? "CONFLICT" : "INVALID");
   }
 }
 
-// Called for each serial character. All ordinary motion commands pass through
-// requestGroup(), which validates resource conflicts and settling intervals.
+// Input handler ONLY decodes input and queues a command. It never calls
+// requestUserStep() or sup.requestGroup().
 static void onUserCommand(uint8_t rawInput) {
-  if (rawInput == '\r' || rawInput == '\n' || rawInput == ' ') return;
+  if (rawInput == '\r' || rawInput == '\n' || rawInput == ' ' || rawInput == '\t')
+    return;
 
   if (rawInput == 'x' || rawInput == 'X' || rawInput == '!') {
     pendingUserStep = false;
     manualActive = false;
+    manualSub = SUB_NONE;
     Serial.println("[user] Emergency stop requested.");
-    seq.abort();
+    seq.abort();  // calls sup.emergencyStop(); motors are commanded off
+    return;
+  }
+
+  if (rawInput == '?' || rawInput == 'h' || rawInput == 'H') {
+    Serial.println("Commands: t=turn left 90 deg, d=drive forward 1 ft, x=emergency stop, ?=help");
     return;
   }
 
   Step userStep{};
   if (!userCharToStep(rawInput, userStep)) {
-    Serial.printf("[user] Unknown command '%c'. Use t=turn, d=drive, x=stop.\n",
+    Serial.printf("[user] Unknown command '%c'. Type ? for help.\n",
                   (rawInput >= 32 && rawInput <= 126) ? rawInput : '?');
     return;
   }
@@ -1090,11 +1102,15 @@ static void onUserCommand(uint8_t rawInput) {
     Serial.println("[user] A command is already queued; new command ignored.");
     return;
   }
-  requestUserStep(userStep, true);
+
+  queuedUserStep = userStep;
+  pendingUserStep = true;
+  Serial.printf("[user] Command queued: %s\n", PRIM_NAME[(int)queuedUserStep.prim]);
 }
 
+// Sole owner of manual command execution, completion polling, and retries.
 static void serviceUserCommands() {
-  // Report completion of a manually requested action. pollResult() is one-shot.
+  // 1. Collect the result of the currently running manual action.
   if (manualActive) {
     Result r = sup.pollResult(manualSub);
     if (r != Result::RUNNING) {
@@ -1104,21 +1120,15 @@ static void serviceUserCommands() {
     }
   }
 
-  // Retry only transient refusals; requestUserStep() leaves the command queued
-  // if the gate still reports BUSY/SETTLING.
+  // 2. Try to start the queued command. BUSY / SETTLING leaves it queued.
   if (pendingUserStep && !manualActive) {
-    Step retry = queuedUserStep;
-    pendingUserStep = false;
-    requestUserStep(retry, true);
+    requestUserStep(queuedUserStep);
   }
 }
 
 // ============================================================================
 // MAIN
 // ============================================================================
-static Superstructure sup;
-static Sequencer      seq(sup);
-static Context        ctx{};
 
 void setup() {
   Serial.begin(115200);
@@ -1141,15 +1151,14 @@ void setup() {
 void loop() {
   feedWatchdog();
 
-  // 1. Poll serial input every loop pass and route each character through
-  //    onUserCommand(). The command handler calls sup.requestGroup().
+  // 1. Input only queues commands; it never starts subsystem work directly.
   while (Serial.available() > 0) {
     onUserCommand((uint8_t)Serial.read());
   }
 
   sup.update();              // advance every active subsystem
-  serviceUserCommands();     // poll manual results and retry BUSY/SETTLING requests
-  seq.update();              // autonomous sequencer also uses requestGroup()
+  seq.update();              // let the sequencer consume its result before manual polling
+  serviceUserCommands();     // sole path that starts/retries manual commands
 
 #if LOG_STATES
   static uint32_t lastDump = 0;
