@@ -1,7 +1,65 @@
-## Q&A: Command Sources in FRC/Robot Architecture
+##  
 --- 
 ### Q 
-teensy/doc/seq_sup_sub_case2.cpp calls sup.requestGroup from two requestors -- Sequencer.update and requestUserStep (onUserCommand). 
+
+Currently requestUserStep is called by either onUserCommand or serviceUserCommands. 
+
+how about  
+1, onUserCommand does not call requestUserStep but queue up immediately
+2, serviceUserCommands calls requestUserStep 
+
+In this way, we only have one chain of command : onUserCommand  -- serviceUserCommands  -- requestUserStep 
+Also, I can think of serviceUserCommands as an another Sequencer.
+ 
+
+### A 
+Yes, that is a much cleaner architecture! Moving the queuing logic entirely out of onUserCommand() and letting serviceUserCommands() handle the calls to requestGroup() creates a single, predictable linear chain:
+onUserCommand() ---> Queue Up Immediately ---> serviceUserCommands() ---> requestGroup()
+
+Why this design is cleaner:
+Single Responsibility: onUserCommand() becomes purely an input parser. Its only job is to translate incoming characters (like t or d) into a Step object and drop it into a queue or slot, completely detached from the complexities of locks, states, or whether the subsystem is currently busy.
+
+Decoupled Timing: The background service loop (serviceUserCommands()) acts as the gatekeeper that attempts execution. If the superstructure rejects the command with BUSY or SETTLING, it simply remains in the queue and tries again on the next pass, keeping all retry logic centralized away from the raw hardware interrupt/serial read handlers.
+
+
+onUserCommand() queues commands; it does not start ordinary motion commands directly.
+serviceUserCommands() is the only function that starts or retries manual commands.
+BUSY and SETTLING requests remain queued and are retried.
+A second motion command is ignored while another command is queued.
+x or ! triggers an emergency stop.
+The main loop updates the autonomous sequencer before servicing manual commands, so the sequencer can consume its result before manual-command processing.
+
+
+### Q 
+Why the below is needed? 
+The main loop updates the autonomous sequencer before servicing manual commands, so the sequencer can consume its result before manual-command processing.
+ 
+### A 
+It is not strictly needed, but I recommend keeping seq.update() before serviceUserCommands() for this design.
+The important issue is how the autonomous sequencer and manual-command service share the Superstructure.
+Why the order matters
+Suppose an autonomous action has just finished.
+1. sup.update() detects completion and stores the result.
+2. seq.update() consumes that result using sup.pollResult() and advances the autonomous sequence.
+3. serviceUserCommands() attempts to start a queued manual command.
+This order lets the sequencer process its completed action before the manual-command service attempts to acquire resources.
+What if we reverse the order?
+If serviceUserCommands() runs first, it may start a manual command immediately after sup.update() releases the autonomous action's resources. Then seq.update() processes the autonomous result and might request its next action.
+The superstructure's resource checks should prevent conflicting actions from starting simultaneously, so reversing the order is not inherently unsafe. However, it can make the autonomous sequencer encounter BUSY or SETTLING and retry later.
+
+One important distinction: this ordering does not guarantee that manual commands wait until the entire autonomous sequence finishes. It only gives the autonomous sequencer first opportunity to request its next action.
+If your intended policy is that a manual command must wait until the entire autonomous sequence finishes, we should add an explicit policy check in serviceUserCommands(), such as checking whether seq.state() is DONE or FAILED. That is a separate design choice from the order of these calls.
+
+---
+### Q 
+How does Sequencer knows advance to the next primitive when previous one is done? 
+
+### A 
+In this codebase, the Sequencer advances to the next primitive by actively polling the progress of the current step (or group of steps) inside its update() method.
+
+--- 
+### Q 
+sup.requestGroup is called by two requestors -- Sequencer.update and requestUserStep (from onUserCommand or serviceUserCommands for queued up user commands). 
 Does the robot code have two sources for the requestor—one from user input and the other from the sequencer?
 
 ### A 
