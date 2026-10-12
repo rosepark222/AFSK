@@ -10,7 +10,7 @@ Yes, and it is the more common arrangement, especially in FRC. In the current co
 
 #### Who writes what today
 
-In `robot_all_in_one_case2.cpp`, the superstructure does all of this:
+In `seq_sup_sub_case2.cpp`, the superstructure does all of this:
 
 | Change | Done by | Where |
 |---|---|---|
@@ -121,7 +121,7 @@ The superstructure only forwards the news: when a subsystem's result is taken, i
 - **More machinery in the base class.** It is written once, but it is subtle, and it has to treat a blocking `doStep()` (Case 1) the same as a polling one.
 - **Harder to see the whole picture.** Transitions are spread across subsystems, so keep `dumpStates()` reading each `state()`.
 
-I'd use this design for new code. If you'd like, I can rewrite `robot_all_in_one_case2.cpp` with the base class, per-subsystem holdoff, and a slimmer superstructure.
+I'd use this design for new code. If you'd like, I can rewrite `seq_sup_sub_case2.cpp` with the base class, per-subsystem holdoff, and a slimmer superstructure.
 
 ---
 
@@ -185,7 +185,7 @@ By the single-source-of-truth rule alone, state in the subsystems is better. The
 
 #### Where the current code has two copies
 
-In `robot_all_in_one_case2.cpp`, "is the Mic running?" is stored twice:
+In `seq_sup_sub_case2.cpp`, "is the Mic running?" is stored twice:
 
 | Copy | Written by |
 |---|---|
@@ -225,4 +225,4 @@ Facts that belong to no single subsystem still have one owner, the superstructur
 
 The rule decides which design is correct, but not which is easiest to read. The previous answer recommended the central version for a first implementation because it can be read in one function. That advice was about readability, not about the rule. If you want the design that cannot get out of sync, choose state in the subsystems. If you want something readable that still follows the rule, choose the middle path, because it removes the duplicated state with only a few lines of change.
 
-If you'd like, I can rewrite `robot_all_in_one_case2.cpp` using subsystem-owned state, including the Mic's own holdoff, and delete the slot state array.
+If you'd like, I can rewrite `seq_sup_sub_case2.cpp` using subsystem-owned state, including the Mic's own holdoff, and delete the slot state array.
