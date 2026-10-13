@@ -1,5 +1,26 @@
 # Robot State Design: Q&A Session
 
+```mermaid
+stateDiagram-v2
+ 
+AutoSequencer --> Superstructure: update
+Superstructure --> Subsystem1: request
+Superstructure --> Subsystem2: request
+Superstructure --> Subsystem3: request
+```
+
+```mermaid
+stateDiagram-v2
+onUserCommand --> serviceUserCommands
+serviceUserCommands-->  Superstructure: single-primitive
+serviceUserCommands-->  Sequencer: multi-primitive
+onUserCommand--> Superstructure: abort
+Sequencer --> Superstructure: update
+Superstructure --> Subsystem1: request
+Superstructure --> Subsystem2: request
+Superstructure --> Subsystem3: request
+```
+
 Topic: designing subsystem, superstructure, and sequencer states for a robot with a speaker, 2 mics, and a chassis (Teensy).
 
 ---
