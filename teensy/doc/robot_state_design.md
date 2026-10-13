@@ -1,5 +1,6 @@
 # Robot State Design: Q&A Session
-
+---
+Auto mode:
 ```mermaid
 stateDiagram-v2
  
@@ -8,7 +9,8 @@ Superstructure --> Subsystem1: request
 Superstructure --> Subsystem2: request
 Superstructure --> Subsystem3: request
 ```
-
+---
+Manual mode:
 ```mermaid
 stateDiagram-v2
 onUserCommand --> serviceUserCommands
