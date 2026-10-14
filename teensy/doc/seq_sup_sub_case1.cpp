@@ -37,11 +37,7 @@
   #define HAVE_WDT 0
 #endif
 
-static inline void feedWatchdog() {
-#if HAVE_WDT
-  g_wdt.feed();
-#endif
-}
+
 
 // ----------------------------- robot role ------------------------------------
 #define ROBOT_A 1
@@ -133,6 +129,12 @@ struct Context {         // "blackboard": data passed between steps
 };
 
 static inline int idx(Owner o) { return (int)o; }
+
+static inline void feedWatchdog() {
+#if HAVE_WDT
+  g_wdt.feed();
+#endif
+}
 
 static float wrap180(float a) {
   while (a >  180.0f) a -= 360.0f;
