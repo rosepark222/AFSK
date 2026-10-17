@@ -29,7 +29,7 @@ Tools → USB Type → MTP Disk (Experimental)
 #include <SD.h>
 #include <MTP_Teensy.h>
 
-bool isDSP = true; // Mode flag
+bool isDSP = false; // Mode flag
 
 void setup() {
   Serial.begin(9600);
