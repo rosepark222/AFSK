@@ -181,7 +181,7 @@ static constexpr float SPK_AFSK_FREQ_MARK = 6000.0f;
 static constexpr float SPK_AFSK_FREQ_SPACE = 8000.0f;
 static constexpr uint32_t SPK_AFSK_BAUD_RATE = 100;
 static constexpr uint32_t SPK_AFSK_BIT_PERIOD_US = 1000000UL / SPK_AFSK_BAUD_RATE;
-static constexpr float SPK_AFSK_AMPLITUDE = 0.10f;
+static constexpr float SPK_AFSK_AMPLITUDE = 0.80f;
 
 AudioInputI2S     i2s_in;
 AudioRecordQueue  queue1;                         // AFSK RX queue (left channel)
@@ -1049,7 +1049,7 @@ static bool mixFFT() {
   }
   lastBeatHz=(float)bestK*MIC_FS/(float)CHIRP_SAMPLES;
   float ratio=best/(second+DSP_EPS);
-  Serial.printf("[mic] dechirp: rough=%.4f beat=%.3f Hz peak/runner-up=%.2f\n",lastRoughCorrelation,lastBeatHz,ratio);
+  Serial.printf("[mic] mixFFT: rough=%.4f beat=%.3f Hz peak/runner-up=%.2f\n",lastRoughCorrelation,lastBeatHz,ratio);
   return isfinite(best) && best>DSP_EPS && ratio>=DETECT_RATIO_THRESHOLD;
 }
 // Fine analytic correlation checks the chirp around the rough alignment. The
@@ -1658,31 +1658,83 @@ private:
 };
 
 // ============================================================================
-// SEQUENCES
+// SEQUENCES erp029
 // Step = { prim, param, timeout_ms, onFail, gotoIdx }
 // ============================================================================
 #if ROBOT_ROLE == ROBOT_A
-// Robot A: hear chirp -> TDOA -> turn 90 -> hear chirp -> TDOA -> bearing ->
-//          face source -> drive 1 ft -> send AFSK "stop chirp"
-static const Step SEQ[] = {
-  { Prim::LISTEN_CHIRP,    0,    10000, OnFail::ABORT, 0 },   // 0
-  { Prim::COMPUTE_TDOA,    1,      500, OnFail::ABORT, 0 },   // 1  -> theta1, heading1
-  { Prim::TURN,            90,    3000, OnFail::ABORT, 0 },   // 2
-  { Prim::WAIT,            0,      300, OnFail::ABORT, 0 },   // 3  settle (overlaps the superstructure settle)
-  { Prim::LISTEN_CHIRP,    0,    10000, OnFail::ABORT, 0 },   // 4
-  { Prim::COMPUTE_TDOA,    2,      500, OnFail::ABORT, 0 },   // 5  -> theta2, heading2
-  { Prim::COMPUTE_BEARING, 0,       10, OnFail::ABORT, 0 },   // 6  -> bearing
-  { Prim::TURN,            NAN,   3000, OnFail::ABORT, 0 },   // 7  NAN = use ctx.bearing
-  { Prim::DRIVE,           1.0f,  4000, OnFail::ABORT, 0 },   // 8  feet
-  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 9
-};
-#else
-// Robot B: chirp 0.7 s, listen for AFSK 2.3 s; nothing heard -> repeat; heard -> do it, DONE
+
 static const Step SEQ[] = {
   { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
-  { Prim::LISTEN_AFSK,       0, 2300, OnFail::GOTO,  0 },     // 1  timeout -> back to step 0
-  { Prim::EXEC_RECEIVED_CMD, 0, 5000, OnFail::ABORT, 0 },     // 2  then DONE
+  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
+  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
+  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
+  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
+  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
+  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
+  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
+
+  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
 };
+// Robot A: hear chirp -> TDOA -> turn 90 -> hear chirp -> TDOA -> bearing ->
+//          face source -> drive 1 ft -> send AFSK "stop chirp"
+// static const Step SEQ[] = {
+//   { Prim::LISTEN_CHIRP,    0,    10000, OnFail::ABORT, 0 },   // 0
+//   { Prim::COMPUTE_TDOA,    1,      500, OnFail::ABORT, 0 },   // 1  -> theta1, heading1
+//   { Prim::TURN,            90,    3000, OnFail::ABORT, 0 },   // 2
+//   { Prim::WAIT,            0,      300, OnFail::ABORT, 0 },   // 3  settle (overlaps the superstructure settle)
+//   { Prim::LISTEN_CHIRP,    0,    10000, OnFail::ABORT, 0 },   // 4
+//   { Prim::COMPUTE_TDOA,    2,      500, OnFail::ABORT, 0 },   // 5  -> theta2, heading2
+//   { Prim::COMPUTE_BEARING, 0,       10, OnFail::ABORT, 0 },   // 6  -> bearing
+//   { Prim::TURN,            NAN,   3000, OnFail::ABORT, 0 },   // 7  NAN = use ctx.bearing
+//   { Prim::DRIVE,           1.0f,  4000, OnFail::ABORT, 0 },   // 8  feet
+//   { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 9
+// };
+#else
+// Robot ready. Serial commands: t=left 90 deg, d=forward 1 ft, x=stop, ?=help
+// [sup] LISTEN_CHIRP      TIMEOUT  total=10000ms  max_total=10000ms  max_update=9999558us
+// [mic] fine analytic correlation=0.7951
+// [mic] dechirp: rough=0.1456 beat=4.037 Hz peak/runner-up=5.46
+  
+static const Step SEQ[] = {
+  { Prim::LISTEN_CHIRP,    0,    10000, OnFail::GOTO, 0 },   // 4
+  { Prim::LISTEN_CHIRP,    0,    10000, OnFail::GOTO, 0 },   // 4
+  { Prim::LISTEN_CHIRP,    0,    10000, OnFail::GOTO, 0 },   // 4
+  { Prim::LISTEN_CHIRP,    0,    10000, OnFail::GOTO, 0 },   // 4
+
+  { Prim::LISTEN_AFSK,       0, 2300, OnFail::GOTO,  0 }, 
+  { Prim::LISTEN_AFSK,       0, 2300, OnFail::GOTO,  0 }, 
+  { Prim::LISTEN_AFSK,       0, 2300, OnFail::GOTO,  0 }, 
+  { Prim::LISTEN_AFSK,       0, 2300, OnFail::GOTO,  0 }, 
+  { Prim::LISTEN_AFSK,       0, 2300, OnFail::GOTO,  0 },  
+  { Prim::LISTEN_AFSK,       0, 2300, OnFail::GOTO,  0 }, 
+};
+// Robot B: chirp 0.7 s, listen for AFSK 2.3 s; nothing heard -> repeat; heard -> do it, DONE
+// static const Step SEQ[] = {
+//   { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
+//   { Prim::LISTEN_AFSK,       0, 2300, OnFail::GOTO,  0 },     // 1  timeout -> back to step 0
+//   { Prim::EXEC_RECEIVED_CMD, 0, 5000, OnFail::ABORT, 0 },     // 2  then DONE
+// };
 #endif
 
 // ============================================================================
