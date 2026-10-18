@@ -128,7 +128,7 @@ enum class Owner : uint8_t { NONE = 0, SPEAKER, MIC, CHASSIS, COUNT };
 
 // AFSK command ids (shared by both robots)
 enum Cmd : uint8_t {
-  CMD_NONE = 0, CMD_STOP_CHIRP, CMD_LED_OFF, CMD_SEND_ACK, CMD_ACK,
+  CMD_NONE = 0, CMD_STOP_CHIRP, CMD_LED_ON, CMD_LED_OFF, CMD_SEND_ACK, CMD_ACK,
   CMD_TURN_LEFT, CMD_TURN_RIGHT, CMD_TURN_180, CMD_FORWARD
 };
 
@@ -222,7 +222,7 @@ static constexpr float SPK_CHIRP_AMPLITUDE = 0.8f;
 // RAM2 for the larger dechirp work/ring buffers below. The linker checks fit.
 static int16_t spkChirpBuffer[SPK_CHIRP_SAMPLES];
 static bool spkChirpGenerated = false;
-
+static constexpr uint8_t LED_1 = 1;
 // ============================================================================
 // SPEAKER subsystem   (SEND_CHIRP, SEND_AFSK)
 // Output is assumed to play in the background (Audio library / DMA), so update()
@@ -1421,7 +1421,9 @@ static bool cmdToStep(uint8_t cmd, Step& out) {
     case CMD_TURN_180:   out = { Prim::TURN, 180.0f, 4000, OnFail::ABORT, 0 }; return true;
     case CMD_FORWARD:    out = { Prim::DRIVE,  1.0f, 4000, OnFail::ABORT, 0 }; return true;
     case CMD_SEND_ACK:   out = { Prim::SEND_AFSK, (float)CMD_ACK, 1500, OnFail::ABORT, 0 }; return true;
-    case CMD_LED_OFF:    digitalWrite(LED_BUILTIN, LOW);
+    case CMD_LED_ON:    digitalWrite(LED_1, HIGH);
+                         out = { Prim::WAIT, 0, 0, OnFail::ABORT, 0 }; return true;
+    case CMD_LED_OFF:    digitalWrite(LED_1, LOW);
                          out = { Prim::WAIT, 0, 0, OnFail::ABORT, 0 }; return true;
     case CMD_STOP_CHIRP: out = { Prim::WAIT, 0, 0, OnFail::ABORT, 0 }; return true;  // Robot B: ending its
                                                                                      // sequence stops chirping
@@ -1684,32 +1686,32 @@ private:
 // SEQUENCES erp029
 // Step = { prim, param, timeout_ms, onFail, gotoIdx }
 // ============================================================================
-#if ROBOT_ROLE == ROBOT_A
+#if ROBOT_ROLE == ROBOT_B
 
 static const Step SEQ[] = {
 
+  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
   { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
   { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
+  // { Prim::SEND_AFSK,       (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
+  // { Prim::SEND_AFSK,       (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
+  // { Prim::SEND_AFSK,       (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
+  // { Prim::SEND_AFSK,       (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
+  // { Prim::SEND_AFSK,       (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
+  // { Prim::SEND_AFSK,       (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
+  // { Prim::SEND_AFSK,       (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
+  // { Prim::SEND_AFSK,       (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
+  // { Prim::SEND_AFSK,       (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
+  // { Prim::SEND_AFSK,       (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
 
   { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
   { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
@@ -1738,11 +1740,12 @@ static const Step SEQ[] = {
 static const Step SEQ[] = {
 
   { Prim::LISTEN_AFSK,       0, 2300, OnFail::GOTO,  0 }, 
+  { Prim::EXEC_RECEIVED_CMD, 0, 5000, OnFail::ABORT, 0 },
   { Prim::LISTEN_AFSK,       0, 2300, OnFail::GOTO,  0 }, 
   { Prim::LISTEN_AFSK,       0, 2300, OnFail::GOTO,  0 }, 
   { Prim::LISTEN_AFSK,       0, 2300, OnFail::GOTO,  0 }, 
   { Prim::LISTEN_AFSK,       0, 2300, OnFail::GOTO,  0 },  
-  { Prim::LISTEN_AFSK,       0, 2300, OnFail::GOTO,  0 }, 
+  { Prim::EXEC_RECEIVED_CMD, 0, 5000, OnFail::ABORT, 0 },
 
   { Prim::LISTEN_CHIRP,    0,    10000, OnFail::GOTO, 0 },   // 4
   { Prim::LISTEN_CHIRP,    0,    10000, OnFail::GOTO, 0 },   // 4
@@ -1846,8 +1849,8 @@ static void serviceUserCommands() {
 
 void setup() {
   Serial.begin(115200);
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, HIGH);
+  pinMode(LED_1, OUTPUT);
+  digitalWrite(LED_1, LOW);
 
   AudioMemory(cfg::AUDIO_MEMORY_BLOCKS);           // once, before any Audio object is used
 
