@@ -481,28 +481,52 @@ private:
   static int clockCounter = 0;
   static int lastSoft = -1;
 
-  static int clockRecovery(int softBit) {
+static int clockRecovery(int softBit) {
     int committed = -1;
 
-    if (softBit != -1 && lastSoft != -1 && softBit != lastSoft) {
-      int mid = SAMPLES_PER_BIT / 2;
-      if (clockCounter < mid) {
-        clockCounter += 2;
-      } else {
-        clockCounter -= 2;
-      }
+    // Static variables to track consecutive identical soft bits
+    static int currentSoftRun = -1;
+    static int runLength = 0;
+    constexpr int DEBOUNCE_THRESHOLD = 3; // Must persist for 3 audio samples to be trusted
+
+    if (softBit != -1) {
+        if (softBit == currentSoftRun) {
+            runLength++;
+        } else {
+            currentSoftRun = softBit;
+            runLength = 1;
+        }
     }
 
-    if (softBit != -1) lastSoft = softBit;
+    // Only trigger transition logic if the new softBit value has persisted 
+    // across multiple audio samples (ignoring isolated 1-sample noise spikes)
+    bool validTransition = false;
+    if (runLength == DEBOUNCE_THRESHOLD && lastSoft != -1 && currentSoftRun != lastSoft) {
+        validTransition = true;
+    }
+
+    if (validTransition) {
+        int mid = SAMPLES_PER_BIT / 2;
+        if (clockCounter < mid) {
+            clockCounter += 2; // Nudge forward
+        } else {
+            clockCounter -= 2; // Nudge backward
+        }
+    }
+
+    // Update lastSoft only when we cross a validated boundary or update the run
+    if (runLength >= DEBOUNCE_THRESHOLD && softBit != -1) {
+        lastSoft = currentSoftRun;
+    }
 
     clockCounter++;
     if (clockCounter >= SAMPLES_PER_BIT) {
-      clockCounter = 0;
-      if (lastSoft != -1) committed = lastSoft;
+        clockCounter = 0;
+        if (lastSoft != -1) committed = lastSoft;
     }
-
+    
     return committed;
-  }
+}
 
   // ─── CRC ──────────────────────────────────────────────────────────────────
   static uint16_t crc16_ccitt_false_update(uint16_t crc, uint8_t data) {
@@ -767,7 +791,7 @@ private:
 
   // The old loop() body. Drains the audio that has arrived; returns true when a
   // CRC-valid frame with a payload was accepted. cmd = first payload byte.
-  static bool afskDecodeFrameCore(uint8_t& cmd) {
+  static bool afskDecodeFrame(uint8_t& cmd) {
     while (queue1.available()) {
       debugBlockCount++;
       int16_t* block = queue1.readBuffer();
@@ -1108,8 +1132,6 @@ static bool micTdoaSeconds(float& dt) {
 
 static void micStop() { if (micQueueRunning) { chirpQueueL.end(); chirpQueueR.end(); micQueueRunning=false; } while(chirpQueueL.available()) chirpQueueL.freeBuffer(); while(chirpQueueR.available()) chirpQueueR.freeBuffer(); }
 
-// AFSK: merged. The receiver functions are defined above.
-static bool afskDecodeFrame(uint8_t& cmd) { return afskDecodeFrameCore(cmd); }
 
 class Mic : public Subsystem {
 public:
@@ -1185,6 +1207,7 @@ private:
       feedWatchdog();
       uint8_t cmd;
       if (afskDecodeFrame(cmd)) {
+        Serial.printf("Received command ID: %u\n", cmd);
         ctx_->rxCmd = cmd;
         r = Result::SUCCESS;
         break;
@@ -1664,14 +1687,6 @@ private:
 #if ROBOT_ROLE == ROBOT_A
 
 static const Step SEQ[] = {
-  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
-  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
-  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
-  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
-  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
-  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
-  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
-  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
 
   { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
   { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
@@ -1695,6 +1710,15 @@ static const Step SEQ[] = {
   { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
   { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
   { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
+
+  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
+  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
+  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
+  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
+  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
+  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
+  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
+  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
 };
 // Robot A: hear chirp -> TDOA -> turn 90 -> hear chirp -> TDOA -> bearing ->
 //          face source -> drive 1 ft -> send AFSK "stop chirp"
@@ -1711,16 +1735,7 @@ static const Step SEQ[] = {
 //   { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 9
 // };
 #else
-// Robot ready. Serial commands: t=left 90 deg, d=forward 1 ft, x=stop, ?=help
-// [sup] LISTEN_CHIRP      TIMEOUT  total=10000ms  max_total=10000ms  max_update=9999558us
-// [mic] fine analytic correlation=0.7951
-// [mic] dechirp: rough=0.1456 beat=4.037 Hz peak/runner-up=5.46
-  
 static const Step SEQ[] = {
-  { Prim::LISTEN_CHIRP,    0,    10000, OnFail::GOTO, 0 },   // 4
-  { Prim::LISTEN_CHIRP,    0,    10000, OnFail::GOTO, 0 },   // 4
-  { Prim::LISTEN_CHIRP,    0,    10000, OnFail::GOTO, 0 },   // 4
-  { Prim::LISTEN_CHIRP,    0,    10000, OnFail::GOTO, 0 },   // 4
 
   { Prim::LISTEN_AFSK,       0, 2300, OnFail::GOTO,  0 }, 
   { Prim::LISTEN_AFSK,       0, 2300, OnFail::GOTO,  0 }, 
@@ -1728,6 +1743,13 @@ static const Step SEQ[] = {
   { Prim::LISTEN_AFSK,       0, 2300, OnFail::GOTO,  0 }, 
   { Prim::LISTEN_AFSK,       0, 2300, OnFail::GOTO,  0 },  
   { Prim::LISTEN_AFSK,       0, 2300, OnFail::GOTO,  0 }, 
+
+  { Prim::LISTEN_CHIRP,    0,    10000, OnFail::GOTO, 0 },   // 4
+  { Prim::LISTEN_CHIRP,    0,    10000, OnFail::GOTO, 0 },   // 4
+  { Prim::LISTEN_CHIRP,    0,    10000, OnFail::GOTO, 0 },   // 4
+  { Prim::LISTEN_CHIRP,    0,    10000, OnFail::GOTO, 0 },   // 4
+
+
 };
 // Robot B: chirp 0.7 s, listen for AFSK 2.3 s; nothing heard -> repeat; heard -> do it, DONE
 // static const Step SEQ[] = {
