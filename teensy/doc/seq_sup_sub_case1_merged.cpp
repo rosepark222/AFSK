@@ -1839,7 +1839,8 @@ static bool userCharToStep(char ch, Step& out) {
   switch (ch) {
     case 't':
     case 'T':
-      out = { Prim::TURN, 90.0f, 3000, OnFail::ABORT, 0 };
+      // out = { Prim::TURN, 90.0f, 3000, OnFail::ABORT, 0 };
+      out = { Prim::PLAY_WAVE,          0,  5000, OnFail::ABORT, 0 };
       return true;
     case 'd':
     case 'D':
