@@ -115,11 +115,11 @@ namespace cfg {
 // ================================ types ======================================
 enum class Prim : uint8_t {
   WAIT, LISTEN_CHIRP, COMPUTE_TDOA, COMPUTE_BEARING, TURN, DRIVE,
-  SEND_CHIRP, SEND_AFSK, LISTEN_AFSK, EXEC_RECEIVED_CMD, COUNT
+  SEND_CHIRP, SEND_AFSK, LISTEN_AFSK, EXEC_RECEIVED_CMD, PLAY_WAVE, COUNT
 };
 static const char* PRIM_NAME[] = {
   "WAIT", "LISTEN_CHIRP", "COMPUTE_TDOA", "COMPUTE_BEARING", "TURN", "DRIVE",
-  "SEND_CHIRP", "SEND_AFSK", "LISTEN_AFSK", "EXEC_RECEIVED_CMD"
+  "SEND_CHIRP", "SEND_AFSK", "LISTEN_AFSK", "EXEC_RECEIVED_CMD", "PLAY_WAVE"
 };
 
 enum class Result : uint8_t { RUNNING, SUCCESS, TIMEOUT, FAIL, REJECTED, ABORTED };
@@ -210,6 +210,11 @@ AudioConnection    fskToMixerR(fskOsc, 0, spkMixerR, 0);
 AudioConnection    chirpToMixerR(chirpTxQueue, 0, spkMixerR, 1);
 AudioConnection    mixerToI2sR(spkMixerR, 0, i2s_out, 1);
 
+AudioPlaySdWav playWav1;
+// Route left and right channels into the existing speaker mixer slots (e.g., slot 2)
+AudioConnection waveToMixerL(playWav1, 0, spkMixerL, 2);
+AudioConnection waveToMixerR(playWav1, 1, spkMixerR, 2);
+
 // Chirp TX waveform copied from the standalone transmitter sketch.
 static constexpr uint32_t SPK_CHIRP_SAMPLE_RATE = 44100;
 static constexpr uint32_t SPK_CHIRP_SAMPLES = 8u * 4096u;
@@ -271,6 +276,8 @@ static void spkBegin() {
   spkMixerL.gain(1, 1.0f);
   spkMixerR.gain(0, 1.0f);
   spkMixerR.gain(1, 1.0f);
+  spkMixerL.gain(2, 1.0f);
+  spkMixerR.gain(2, 1.0f);
   if (!spkChirpGenerated) spkGenerateChirp();
 }
 
@@ -360,11 +367,19 @@ static uint32_t spkStartAfsk(uint8_t cmd) {
 
 static void spkStop() {
   fskOsc.amplitude(0.0f);
+  playWav1.stop();
 }
 
 class Speaker : public Subsystem {
 public:
   void begin() { spkBegin(); }
+
+  // Helper to map parameter float to a wave filename
+  const char* getWaveFilename(float param) {
+    if (param == 0.0f) return "B/yes.WAV";
+    if (param == 1.0f) return "B/no.WAV";
+    return "B/yes.WAV"; 
+  }
 
   void start(const Step& s, Context*) override {
     if (s.prim == Prim::SEND_CHIRP) {
@@ -373,6 +388,15 @@ public:
       // to finish after it returns; don't truncate the ~743 ms reference chirp.
       endMs_ = millis() + 10u;
       st_ = CHIRP;
+    } else if (s.prim == Prim::PLAY_WAVE) {
+      const char* filename = getWaveFilename(s.param);
+      if (playWav1.play(filename)) {
+        Serial.printf("[speaker] Playing file: %s\n", filename);
+      } else {
+        Serial.printf("[speaker] Error: Failed to play %s\n", filename);
+      }
+      st_ = WAVE;
+      
     } else {                                       // SEND_AFSK
       const uint32_t now = millis();
       endMs_ = now + spkStartAfsk((uint8_t)s.param);
@@ -382,6 +406,16 @@ public:
 
   Result update() override {
     if (st_ == IDLE) return Result::SUCCESS;
+
+    if (st_ == WAVE) {
+        if (!playWav1.isPlaying()) {
+          playWav1.stop();
+          st_ = IDLE;
+          return Result::SUCCESS; // File finished playing naturally
+        }
+        return Result::RUNNING;
+    }
+
     if ((int32_t)(millis() - endMs_) >= 0) {       // transmission time elapsed
       spkStop();
       return Result::SUCCESS;
@@ -391,10 +425,10 @@ public:
 
   void abort() override      { forceIdle(); }
   bool isIdle() const override { return st_ == IDLE; }
-  void forceIdle() override  { spkStop(); st_ = IDLE; }
+  void forceIdle() override  { spkStop(); st_ = IDLE; playWav1.stop(); }
 
 private:
-  enum St : uint8_t { IDLE, CHIRP, AFSK } st_ = IDLE;
+  enum St : uint8_t { IDLE, CHIRP, AFSK, WAVE} st_ = IDLE;
   uint32_t endMs_ = 0;
 };
 
@@ -1406,7 +1440,8 @@ enum class SupState : uint8_t { IDLE, SUBSYSTEM_ACTIVE, INTERNAL_ACTIVE, SETTLIN
 static Owner ownerFor(Prim p) {
   switch (p) {
     case Prim::SEND_CHIRP:
-    case Prim::SEND_AFSK:     return Owner::SPEAKER;
+    case Prim::SEND_AFSK:     
+    case Prim::PLAY_WAVE:     return Owner::SPEAKER;
     case Prim::LISTEN_CHIRP:
     case Prim::COMPUTE_TDOA:
     case Prim::LISTEN_AFSK:   return Owner::MIC;
@@ -1702,6 +1737,7 @@ private:
 
 static const Step SEQ[] = {
 
+  { Prim::PLAY_WAVE,          0,  5000, OnFail::ABORT, 0 }, // play yes and abort the seq if play gets timed out
   { Prim::DRIVE,           1.0f,  4000, OnFail::ABORT, 0 },
   { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },
   { Prim::TURN,            90,    3000, OnFail::ABORT, 0 },
