@@ -66,9 +66,12 @@
 // ============================ configuration ==================================
 namespace cfg {
   // motor driver pins (PWM + DIR style). TODO: match your wiring.
-  // Put pull-downs on the PWM pins so motors stay off if the watchdog resets the chip.
-  constexpr uint8_t L_PWM = 2, L_DIR = 3, R_PWM = 4, R_DIR = 5;
-
+  constexpr uint8_t ENA = 14; // PWM speed control for Motor A
+  constexpr uint8_t ENB = 15; // PWM speed control for Motor B
+  constexpr uint8_t IN1 = 34; // Direction control 1
+  constexpr uint8_t IN2 = 35; // Direction control 2
+  constexpr uint8_t IN3 = 16; // Direction control 3
+  constexpr uint8_t IN4 = 17; // Direction control 4
   // gyro
   constexpr uint32_t GYRO_PERIOD_US = 2000;     // read gyro at 500 Hz
   constexpr uint32_t GYRO_MAX_DT_US = 20000;    // longer gap (e.g. mic DSP ran): don't integrate
@@ -82,11 +85,11 @@ namespace cfg {
   constexpr uint8_t TURN_HOLD_TICKS  = 20;      // consecutive loop passes in tolerance and still
 
   // timer fallback if gyro is dead (calibrate on your floor + battery)
-  constexpr int     OPENLOOP_TURN_PWM = 140;
-  constexpr float   OPENLOOP_TURN_DPS = 120.0f;
+  constexpr int     OPENLOOP_TURN_PWM = 200;
+  constexpr float   OPENLOOP_TURN_DPS = 120.0f; // degree per second?
 
   // drive (timer-based with gyro heading hold)
-  constexpr int     DRIVE_PWM      = 150;
+  constexpr int     DRIVE_PWM      = 200;
   constexpr float   DRIVE_FT_PER_S = 1.0f;      // calibrate
   constexpr float   HOLD_KP        = 2.0f;
 
@@ -1235,10 +1238,10 @@ static bool readGyroZ_dps(float& dps) { return false; }
 class Chassis : public Subsystem {
 public:
   void begin() {
-    pinMode(cfg::L_PWM, OUTPUT); pinMode(cfg::L_DIR, OUTPUT);
-    pinMode(cfg::R_PWM, OUTPUT); pinMode(cfg::R_DIR, OUTPUT);
-    analogWriteFrequency(cfg::L_PWM, 20000);
-    analogWriteFrequency(cfg::R_PWM, 20000);
+    pinMode(cfg::ENA, OUTPUT); pinMode(cfg::IN1, OUTPUT); pinMode(cfg::IN2, OUTPUT);
+    pinMode(cfg::ENB, OUTPUT); pinMode(cfg::IN3, OUTPUT); pinMode(cfg::IN4, OUTPUT);
+    analogWriteFrequency(cfg::ENA, 20000);
+    analogWriteFrequency(cfg::ENB, 20000);
     setMotors(0, 0);
 
     // Gyro bias calibration: robot must be still for ~0.5 s at boot.
@@ -1351,16 +1354,25 @@ private:
     return Result::RUNNING;
   }
 
-  void setMotors(int left, int right) {            // -255..255. TODO: match your driver
-    auto drive = [](uint8_t pwmPin, uint8_t dirPin, int v) {
+  void setMotors(int left, int right) {
+    // Example for separate Forward/Reverse pins instead of PWM/DIR
+    auto drive = [](uint8_t pwmPin, uint8_t fwdPin, uint8_t revPin, int v) {
       if (v >  255) v =  255;
       if (v < -255) v = -255;
-      digitalWriteFast(dirPin, v >= 0 ? HIGH : LOW);
       analogWrite(pwmPin, abs(v));
+      if (v >= 0) { // foward
+        digitalWrite(fwdPin, LOW);
+        digitalWrite(revPin, HIGH);
+      } else { // reverse
+        digitalWrite(fwdPin, HIGH);
+        digitalWrite(revPin, LOW);
+      }
     };
-    drive(cfg::L_PWM, cfg::L_DIR, left);
-    drive(cfg::R_PWM, cfg::R_DIR, right);
+    // Map your actual pin constants here
+    drive(cfg::ENA, cfg::IN1, cfg::IN2, left);
+    drive(cfg::ENB, cfg::IN3, cfg::IN4, right);
   }
+ 
 
   Mode     mode_ = STOPPED;
   float    yaw_ = 0, bias_ = 0, rate_ = 0;
@@ -1686,13 +1698,22 @@ private:
 // SEQUENCES erp029
 // Step = { prim, param, timeout_ms, onFail, gotoIdx }
 // ============================================================================
-#if ROBOT_ROLE == ROBOT_B
+#if ROBOT_ROLE == ROBOT_A
 
 static const Step SEQ[] = {
 
+  { Prim::DRIVE,           1.0f,  4000, OnFail::ABORT, 0 },
+  { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },
+  { Prim::TURN,            90,    3000, OnFail::ABORT, 0 },
+  { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },
+
+
   { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::WAIT,                            0, 1000, OnFail::ABORT, 0 },    
   { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::WAIT,                            0, 2000, OnFail::ABORT, 0 },
   { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },
   { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
   { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
   { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
