@@ -1863,7 +1863,7 @@ static void onUserCommand(char ch) {
     Serial.println("[user] EMERGENCY STOP: sequence aborted, motors commanded off");
     return;
   }
-
+  Serial.printf("\n\n [user] command '%c' pressed  \n", ch);
   Step requested{};
   if (!userCharToStep(ch, requested)) {
     if (ch == '?' || ch == 'h' || ch == 'H') {
@@ -1907,6 +1907,8 @@ static void serviceUserCommands() {
 
 void setup() {
   Serial.begin(115200);
+
+  Serial.println("--- BOOT / RESTART DETECTED ---");
   pinMode(LED_1, OUTPUT);
   digitalWrite(LED_1, LOW);
 
