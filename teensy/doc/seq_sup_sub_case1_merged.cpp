@@ -1,43 +1,4 @@
-// =============================================================================
-// robot_all_in_one.cpp   (Teensy 4.x)
-//
-// Layers:   Sequencer  ->  Superstructure  ->  Subsystems (Speaker, Mic, Chassis)
-//
-//   * Sequencer      : "what comes next?"   step table, context, failure policy
-//   * Superstructure : "is it safe now?"    single request() gate, single release
-//                      path, settle timer, deadline watchdog, per-primitive timing
-//   * Subsystems     : do the actual work. Hardware/DSP bits are STUBS (marked TODO).
-//
-// Design choices (from the design notes):
-//   * Each primitive takes the time it needs. Mic::update() may run its whole
-//     DSP pipeline inside one call (no forced slicing).
-//   * Deadlines are enforced INSIDE long loops, and a hardware watchdog is fed
-//     from those loops. Worst-case time per primitive is measured and logged.
-//
-// Arduino IDE: rename this file to robot_all_in_one.ino.  PlatformIO: keep .cpp.
-// Optional: install the "Watchdog_t4" library; it is auto-detected below.
-//
-// MERGE STATUS
-//   [x] afskDecodeFrame   -> merged: the standalone AFSK RX implementation is included directly
-//   [x] spkStartAfsk / spkStop   (100-baud command frame TX)
-//   [x] spkStartChirp   (cyclic 300-1500 Hz chirp TX)
-//   [ ] roughCorrelation / mixFFT / fineCorrelation   (file 4)
-//
-// TODO list (search for "TODO"):
-//   1. Gyro driver            -> readGyroZ_dps()
-//   2. Motor pins + driver    -> cfg::L_PWM etc., Chassis::setMotors()
-//   3. Speaker output         -> tune chirp level and verify TX/RX acoustic alignment
-//   4. Mic DSP (chirp)        -> micFlush / micGetBlock / roughCorrelation / mixFFT /
-//                                fineCorrelation / micTdoaSeconds
-//   5. Command table          -> cmdToStep()
-//   6. Calibrate              -> turn gains, drive speed, settle times, mic spacing
-
-
-// Memory Usage on Teensy 4.1:
-//   FLASH: code:110224, data:53560, headers:8244   free for files:7954436
-//    RAM1: variables:298016, code:107208, padding:23864   free for local variables:95200
-//    RAM2: variables:474720  free for malloc/new:49568
-// =============================================================================
+ 
 #include <Arduino.h>
 #include <Audio.h>
 #include <SD.h>
@@ -56,12 +17,6 @@
 
 
 
-// ----------------------------- robot role ------------------------------------
-#define ROBOT_A 1
-#define ROBOT_B 2
-#define ROBOT_ROLE ROBOT_A          // change to ROBOT_B for the other robot
-
-#define LOG_STATS 1                 // print per-primitive timing when each one finishes
 
 // ============================ configuration ==================================
 namespace cfg {
@@ -115,11 +70,11 @@ namespace cfg {
 // ================================ types ======================================
 enum class Prim : uint8_t {
   WAIT, LISTEN_CHIRP, COMPUTE_TDOA, COMPUTE_BEARING, TURN, DRIVE,
-  SEND_CHIRP, SEND_AFSK, LISTEN_AFSK, EXEC_RECEIVED_CMD, PLAY_WAVE, COUNT
+  SEND_CHIRP, SEND_AFSK, LISTEN_AFSK, EXEC_RECEIVED_CMD, PLAY_WAVE, LCD1_ON, LCD1_OFF, COUNT
 };
 static const char* PRIM_NAME[] = {
   "WAIT", "LISTEN_CHIRP", "COMPUTE_TDOA", "COMPUTE_BEARING", "TURN", "DRIVE",
-  "SEND_CHIRP", "SEND_AFSK", "LISTEN_AFSK", "EXEC_RECEIVED_CMD", "PLAY_WAVE"
+  "SEND_CHIRP", "SEND_AFSK", "LISTEN_AFSK", "EXEC_RECEIVED_CMD", "PLAY_WAVE", "LCD1_ON", "LCD_OFF"
 };
 
 enum class Result : uint8_t { RUNNING, SUCCESS, TIMEOUT, FAIL, REJECTED, ABORTED };
@@ -933,10 +888,11 @@ static constexpr float MIC_FS = 44100.0f;
 static constexpr uint32_t CHIRP_SAMPLES = 32768;
 static constexpr uint32_t FFT_N = 4096;
 static constexpr uint32_t NUM_ROWS = 8;
-static constexpr uint32_t SEARCH_STEP_N = 512;
+static constexpr uint32_t SEARCH_STEP_N = 128; // 512;
 static constexpr float ROUGH_SEARCH_THRESHOLD = 0.10f;
+static constexpr float FINE_SEARCH_THRESHOLD = 0.40f; 
 static constexpr float PEAK_SEARCH_MAX_HZ = 300.0f;
-static constexpr float DETECT_RATIO_THRESHOLD = 8.0f;
+static constexpr float DETECT_RATIO_THRESHOLD = 1.2f; // 5.0f;
 static constexpr float DSP_EPS = 1.0e-12f;
 static constexpr float FINE_XCORR_MAX_LAG = 100;
 static constexpr char FILE_REAL_REF[] = "B/real_300-1500hz_32k_chirp.txt";
@@ -1130,24 +1086,41 @@ static bool fineCorrelation() {
     if((lag&15)==0) feedWatchdog();
   }
   Serial.printf("[mic] fine analytic correlation=%.4f\n",best);
-  return best >= ROUGH_SEARCH_THRESHOLD;
+  return best >= FINE_SEARCH_THRESHOLD;
 }
 static bool dechirp() {
   if(!micDspReady || samplesInRing<CHIRP_SAMPLES || samplesSinceSearch<SEARCH_STEP_N) return false;
   samplesSinceSearch=0;
   lastRoughCorrelation=roughCorrelation();
-  if(lastRoughCorrelation<ROUGH_SEARCH_THRESHOLD) return false;
+  if(lastRoughCorrelation<ROUGH_SEARCH_THRESHOLD) {
+    return false;
+  } else {
+    Serial.printf("[mic] dechirp:   lastRoughCorrelation=%.4f\n", lastRoughCorrelation);
+  }
+
   // Keep both channels aligned for TDOA before mixFFT destroys the ring buffers.
   captureTdoaWindow();
-  if(!fineCorrelation()) return false;
+  //if(!fineCorrelation()) return false;
+
   bool fftValid=mixFFT();
+  Serial.printf("[mic] dechirp: 1\n");
   // Restart from a clean buffer after a candidate, regardless of FFT decision.
   if(micQueueRunning) { chirpQueueL.end(); chirpQueueR.end(); micQueueRunning=false; }
-  while(chirpQueueL.available()) chirpQueueL.freeBuffer();
-  while(chirpQueueR.available()) chirpQueueR.freeBuffer();
+  Serial.printf("[mic] dechirp: 2\n");
+  // Correct way to flush a Teensy audio record queue
+  while (chirpQueueL.available() > 0) {
+      chirpQueueL.readBuffer(); // Consume the data pointer
+      chirpQueueL.freeBuffer(); // Release the block back to the audio memory pool
+  }
+  while (chirpQueueR.available() > 0) {
+      chirpQueueR.readBuffer();
+      chirpQueueR.freeBuffer();
+  }
+  Serial.printf("[mic] dechirp: 3\n");
   searchHead=0; samplesInRing=0; samplesSinceSearch=0; leftRingSum=0.0;
   memset(leftRingBuf,0,sizeof(leftRingBuf)); memset(rightRingBuf,0,sizeof(rightRingBuf));
   chirpQueueL.begin(); chirpQueueR.begin(); micQueueRunning=true;
+  Serial.printf("[mic] dechirp: end fftValid=%d\n", fftValid);
   return fftValid;
 }
 static bool micTdoaSeconds(float& dt) {
@@ -1219,6 +1192,7 @@ private:
       stage_ = ROUGH;  // Diagnostics: dechirp pipeline active
       if (!dechirp()) continue;
       micStop();
+      Serial.printf("[mic] listenChirp: end\n");
       return Result::SUCCESS;  // Capture buffers now hold the chirp
     }
     micStop();
@@ -1550,6 +1524,8 @@ public:
       case Prim::WAIT:                             // timeout_ms is the wait duration
         r = ((int32_t)(now - (startMs_ + active_.timeout_ms)) >= 0) ? Result::SUCCESS : Result::RUNNING;
         break;
+      case Prim::LCD1_ON: digitalWrite(LED_1, HIGH);  r = Result::SUCCESS; break;
+      case Prim::LCD1_OFF: digitalWrite(LED_1, LOW);  r = Result::SUCCESS; break;
 
       case Prim::COMPUTE_BEARING:                  // pure math, finishes immediately
         r = computeBearing(*ctx_) ? Result::SUCCESS : Result::FAIL;
@@ -1733,9 +1709,57 @@ private:
 // SEQUENCES erp029
 // Step = { prim, param, timeout_ms, onFail, gotoIdx }
 // ============================================================================
-#if ROBOT_ROLE == ROBOT_A
+#define ROBOT_ROLE 1       // change to 2 for the other robot
 
-static const Step SEQ[] = {
+//#if ROBOT_ROLE == ROBOT_B
+
+static const Step SEQ_TALK_CHIRP[] = {
+  { Prim::SEND_CHIRP,      (float)CMD_LED_ON,  700, OnFail::ABORT, 0 },
+  { Prim::WAIT,                            0, 5000, OnFail::ABORT, 0 },    
+  { Prim::SEND_CHIRP,      (float)CMD_LED_OFF, 700, OnFail::RETRY, 0 },  // 
+  { Prim::WAIT,                            0, 5000, OnFail::ABORT, 0 },    
+  { Prim::SEND_CHIRP,      (float)CMD_LED_ON,  700, OnFail::ABORT, 0 },
+  { Prim::WAIT,                            0, 5000, OnFail::ABORT, 0 },    
+  { Prim::SEND_CHIRP,      (float)CMD_LED_OFF, 700, OnFail::RETRY, 0 },  // 
+  { Prim::WAIT,                            0, 5000, OnFail::ABORT, 0 }, 
+  { Prim::SEND_CHIRP,      (float)CMD_LED_ON,  700, OnFail::ABORT, 0 },
+  { Prim::WAIT,                            0, 5000, OnFail::ABORT, 0 },    
+  { Prim::SEND_CHIRP,      (float)CMD_LED_OFF, 700, OnFail::RETRY, 0 },  // 
+  { Prim::WAIT,                            0, 5000, OnFail::ABORT, 0 },    
+};
+
+static const Step SEQ_TALK_AFSK[] = {
+
+  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },    
+  { Prim::SEND_AFSK,      (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },    
+  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },    
+  { Prim::SEND_AFSK,      (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },    
+  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },    
+  { Prim::SEND_AFSK,      (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },    
+};
+
+
+
+static const Step SEQ__[] = {
+
+  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },    
+  { Prim::SEND_AFSK,      (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },    
+  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },    
+  { Prim::SEND_AFSK,      (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },    
+  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },    
+  { Prim::SEND_AFSK,      (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
+  { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },    
 
   { Prim::PLAY_WAVE,          0,  5000, OnFail::ABORT, 0 }, // play yes and abort the seq if play gets timed out
   { Prim::DRIVE,           1.0f,  4000, OnFail::ABORT, 0 },
@@ -1745,7 +1769,7 @@ static const Step SEQ[] = {
 
 
   { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::WAIT,                            0, 1000, OnFail::ABORT, 0 },    
+  { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },    
   { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
   { Prim::WAIT,                            0, 2000, OnFail::ABORT, 0 },
   { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
@@ -1759,16 +1783,7 @@ static const Step SEQ[] = {
   { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
   { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
   { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
-  // { Prim::SEND_AFSK,       (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
-  // { Prim::SEND_AFSK,       (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
-  // { Prim::SEND_AFSK,       (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
-  // { Prim::SEND_AFSK,       (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
-  // { Prim::SEND_AFSK,       (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
-  // { Prim::SEND_AFSK,       (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
-  // { Prim::SEND_AFSK,       (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
-  // { Prim::SEND_AFSK,       (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
-  // { Prim::SEND_AFSK,       (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
-  // { Prim::SEND_AFSK,       (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
+ 
 
   { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
   { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
@@ -1793,22 +1808,32 @@ static const Step SEQ[] = {
 //   { Prim::DRIVE,           1.0f,  4000, OnFail::ABORT, 0 },   // 8  feet
 //   { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 9
 // };
-#else
-static const Step SEQ[] = {
+//#else
 
-  { Prim::LISTEN_AFSK,       0, 2300, OnFail::GOTO,  0 }, 
+static const Step SEQ_LISTEN_CHIRP[] = {
+ 
+  { Prim::LCD1_ON,         0,  5000, OnFail::ABORT, 0 }, // play yes and abort the seq if play gets timed out
+  { Prim::WAIT,            0,   1000, OnFail::ABORT, 0 },   // 3  settle (overlaps the superstructure settle)
+  { Prim::LCD1_OFF,        0,  5000, OnFail::ABORT, 0 }, // play yes and abort the seq if play gets timed out
+  { Prim::LISTEN_CHIRP,    0,  100000, OnFail::ABORT, 0 },   // 4
+  { Prim::LCD1_ON,         0,  5000, OnFail::ABORT, 0 }, // play yes and abort the seq if play gets timed out
+ 
+};
+
+static const Step SEQ_LISTEN_AFSK[] = {
+  { Prim::LCD1_ON,         0,  5000, OnFail::ABORT, 0 }, // play yes and abort the seq if play gets timed out
+  { Prim::WAIT,            0,   1000, OnFail::ABORT, 0 },   // 3  settle (overlaps the superstructure settle)
+  { Prim::LCD1_OFF,        0,  5000, OnFail::ABORT, 0 }, // play yes and abort the seq if play gets timed out
+  { Prim::LISTEN_AFSK,       0, 100000, OnFail::GOTO,  0 }, 
   { Prim::EXEC_RECEIVED_CMD, 0, 5000, OnFail::ABORT, 0 },
-  { Prim::LISTEN_AFSK,       0, 2300, OnFail::GOTO,  0 }, 
-  { Prim::LISTEN_AFSK,       0, 2300, OnFail::GOTO,  0 }, 
-  { Prim::LISTEN_AFSK,       0, 2300, OnFail::GOTO,  0 }, 
-  { Prim::LISTEN_AFSK,       0, 2300, OnFail::GOTO,  0 },  
+  { Prim::LISTEN_AFSK,       0, 100000, OnFail::GOTO,  0 }, 
   { Prim::EXEC_RECEIVED_CMD, 0, 5000, OnFail::ABORT, 0 },
-
-  { Prim::LISTEN_CHIRP,    0,    10000, OnFail::GOTO, 0 },   // 4
-  { Prim::LISTEN_CHIRP,    0,    10000, OnFail::GOTO, 0 },   // 4
-  { Prim::LISTEN_CHIRP,    0,    10000, OnFail::GOTO, 0 },   // 4
-  { Prim::LISTEN_CHIRP,    0,    10000, OnFail::GOTO, 0 },   // 4
-
+  { Prim::LISTEN_AFSK,       0, 100000, OnFail::GOTO,  0 }, 
+  { Prim::EXEC_RECEIVED_CMD, 0, 5000, OnFail::ABORT, 0 },
+  { Prim::LISTEN_AFSK,       0, 100000, OnFail::GOTO,  0 }, 
+  { Prim::EXEC_RECEIVED_CMD, 0, 5000, OnFail::ABORT, 0 },
+  { Prim::LISTEN_AFSK,       0, 100000, OnFail::GOTO,  0 }, 
+  { Prim::EXEC_RECEIVED_CMD, 0, 5000, OnFail::ABORT, 0 },
 
 };
 // Robot B: chirp 0.7 s, listen for AFSK 2.3 s; nothing heard -> repeat; heard -> do it, DONE
@@ -1817,7 +1842,7 @@ static const Step SEQ[] = {
 //   { Prim::LISTEN_AFSK,       0, 2300, OnFail::GOTO,  0 },     // 1  timeout -> back to step 0
 //   { Prim::EXEC_RECEIVED_CMD, 0, 5000, OnFail::ABORT, 0 },     // 2  then DONE
 // };
-#endif
+//#endif
 
 // ============================================================================
 // MAIN
@@ -1915,7 +1940,19 @@ void setup() {
   AudioMemory(cfg::AUDIO_MEMORY_BLOCKS);           // once, before any Audio object is used
 
   sup.begin();                                     // init pins, gyro calibration, audio in/out
-  seq.load(SEQ, sizeof(SEQ) / sizeof(SEQ[0]), &ctx);
+
+  #if ROBOT_ROLE == 1 
+  seq.load(SEQ_TALK_CHIRP, sizeof(SEQ_TALK_CHIRP) / sizeof(SEQ_TALK_CHIRP[0]), &ctx);
+  #elif ROBOT_ROLE == 2
+  seq.load(SEQ_LISTEN_CHIRP, sizeof(SEQ_LISTEN_CHIRP) / sizeof(SEQ_LISTEN_CHIRP[0]), &ctx);
+  #elif ROBOT_ROLE == 3
+  seq.load(SEQ_TALK_AFSK, sizeof(SEQ_TALK_AFSK) / sizeof(SEQ_TALK_AFSK[0]), &ctx);
+  #elif ROBOT_ROLE == 4
+  seq.load(SEQ_LISTEN_AFSK, sizeof(SEQ_LISTEN_AFSK) / sizeof(SEQ_LISTEN_AFSK[0]), &ctx);
+  #else
+    #error "invalid"
+
+  #endif
 
 #if HAVE_WDT
   WDT_timings_t wdtCfg;
