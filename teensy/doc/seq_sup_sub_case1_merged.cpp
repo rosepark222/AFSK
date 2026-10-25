@@ -883,7 +883,11 @@ static int clockRecovery(int softBit) {
 // --------------------------- chirp / dechirp DSP ----------------------------
 // Ported from the standalone 32,768-sample chirp detector. The SD card must
 // contain B/real_300-1500hz_32k_chirp.txt and B/imag_300-1500hz_32k_chirp.txt.
-constexpr uint32_t CAP_LEN = 4096;
+constexpr uint32_t CAP_LEN = 4096; // 4096*4;
+
+// CAP_LEN = 4096*4 region `RAM' overflowed by 48736 bytes
+// CAP_LEN = 4096*8 region `RAM' overflowed by 179808 bytes
+
 static constexpr float MIC_FS = 44100.0f;
 static constexpr uint32_t CHIRP_SAMPLES = 32768;
 static constexpr uint32_t FFT_N = 4096;
@@ -1026,13 +1030,16 @@ static bool micGetBlock() {
 }
 static float roughCorrelation() {
   if(samplesInRing<CHIRP_SAMPLES || refEnergy<=DSP_EPS) return 0.0f;
-  float mean=(float)(leftRingSum/(double)CHIRP_SAMPLES),acc=0.0f,energy=0.0f;
+  float mean=(float)(leftRingSum/(double)CHIRP_SAMPLES);
+  float accReal=0.0f, accImag=0.0f, energy=0.0f;
   for(uint32_t n=0;n<CHIRP_SAMPLES;n++) {
-    uint32_t at=(searchHead+n)%CHIRP_SAMPLES; float rx=leftRingBuf[at]-mean;
-    acc+=rx*real_ref[n]; energy+=rx*rx;
+    uint32_t at=(searchHead+n)%CHIRP_SAMPLES; 
+    float rx=leftRingBuf[at]-mean;
+    accReal += rx * real_ref[n]; accImag += rx * imag_ref[n]; energy += rx*rx;
     if((n&4095u)==0) feedWatchdog();
   }
-  return fabsf(acc)/(sqrtf(energy*refEnergy)+DSP_EPS);
+  float magnitude = sqrtf(accReal * accReal + accImag * accImag);
+  return magnitude / (sqrtf(energy * refEnergy) + DSP_EPS);
 }
 // Capture the final 4096 samples in chronological order before FFT overwrites rings.
 static void captureTdoaWindow() {
@@ -1092,11 +1099,8 @@ static bool dechirp() {
   if(!micDspReady || samplesInRing<CHIRP_SAMPLES || samplesSinceSearch<SEARCH_STEP_N) return false;
   samplesSinceSearch=0;
   lastRoughCorrelation=roughCorrelation();
-  if(lastRoughCorrelation<ROUGH_SEARCH_THRESHOLD) {
-    return false;
-  } else {
-    Serial.printf("[mic] dechirp:   lastRoughCorrelation=%.4f\n", lastRoughCorrelation);
-  }
+  if(lastRoughCorrelation<ROUGH_SEARCH_THRESHOLD) { return false; } 
+  else { Serial.printf("[mic] dechirp:   lastRoughCorrelation=%.4f\n", lastRoughCorrelation); }
 
   // Keep both channels aligned for TDOA before mixFFT destroys the ring buffers.
   captureTdoaWindow();
@@ -1157,7 +1161,7 @@ public:
     stage_ = WAITING;
     switch (s.prim) {
       case Prim::LISTEN_CHIRP: st_ = LISTEN_CHIRP; break;
-      case Prim::COMPUTE_TDOA: st_ = TDOA;         break;
+      case Prim::COMPUTE_TDOA: st_ = COMPUTE_TDOA; break;
       case Prim::LISTEN_AFSK:  st_ = LISTEN_AFSK;  break;
       default:                 st_ = IDLE;         break;
     }
@@ -1167,7 +1171,7 @@ public:
   Result update() override {
     switch (st_) {
       case LISTEN_CHIRP: return listenChirp();
-      case TDOA:         return computeTdoa();
+      case COMPUTE_TDOA: return computeTdoa();
       case LISTEN_AFSK:  return listenAfsk();
       default:           return Result::FAIL;
     }
@@ -1228,7 +1232,7 @@ private:
     return r;
   }
 
-  enum St : uint8_t { IDLE, LISTEN_CHIRP, TDOA, LISTEN_AFSK } st_ = IDLE;
+  enum St : uint8_t { IDLE, LISTEN_CHIRP, COMPUTE_TDOA, LISTEN_AFSK } st_ = IDLE;
   Stage    stage_ = WAITING;
   Context* ctx_ = nullptr;
   float    param_ = 0;
