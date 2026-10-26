@@ -912,6 +912,9 @@ DMAMEM static float leftRingBuf[CHIRP_SAMPLES];
 DMAMEM static float rightRingBuf[CHIRP_SAMPLES];
 static float refEnergy = 0.0f;
 static double leftRingSum = 0.0;
+static double leftRingSumSq = 0.0;   // running sum of x^2 over the ring
+static double refSumReal = 0.0;      // sum(real_ref), computed once at init
+static double refSumImag = 0.0;      // sum(imag_ref), computed once at init
 static uint32_t searchHead = 0;       // next ring write position / oldest sample
 static uint32_t samplesInRing = 0;
 static uint32_t samplesSinceSearch = 0;
@@ -992,19 +995,28 @@ static void fft32768(float *re, float *im) {
 static void micBegin() {
   if (!SD.begin(BUILTIN_SDCARD)) { Serial.println("[mic] SD.begin failed; chirp detection disabled"); return; }
   buildTwiddles();
-  // Ring buffers are statically allocated; their RAM fit is checked by the linker.
   memset(leftRingBuf,0,sizeof(leftRingBuf)); memset(rightRingBuf,0,sizeof(rightRingBuf));
+  leftRingSum = 0.0; leftRingSumSq = 0.0;
   int nr=loadFloatFile(FILE_REAL_REF,real_ref,CHIRP_SAMPLES);
   int ni=loadFloatFile(FILE_IMAG_REF,imag_ref,CHIRP_SAMPLES);
-  refEnergy=0.0f; for(uint32_t i=0;i<CHIRP_SAMPLES;i++) refEnergy+=real_ref[i]*real_ref[i];
+  refEnergy=0.0f; refSumReal=0.0; refSumImag=0.0;
+  for(uint32_t i=0;i<CHIRP_SAMPLES;i++) {
+    refEnergy  += real_ref[i]*real_ref[i];
+    refSumReal += (double)real_ref[i];
+    refSumImag += (double)imag_ref[i];
+  }
   micDspReady=(nr==(int)CHIRP_SAMPLES && ni==(int)CHIRP_SAMPLES && refEnergy>DSP_EPS);
-  Serial.printf("[mic] reference samples real=%d imag=%d energy=%.6f; DSP %s\n",nr,ni,refEnergy,micDspReady?"ready":"disabled");
+  Serial.printf("[mic] reference samples real=%d imag=%d energy=%.6f sumRe=%.4f sumIm=%.4f; DSP %s\n",
+                nr,ni,refEnergy,refSumReal,refSumImag,micDspReady?"ready":"disabled");
 }
+
 static void micFlush() {
   if (micQueueRunning) { chirpQueueL.end(); chirpQueueR.end(); micQueueRunning=false; }
   while(chirpQueueL.available()) { chirpQueueL.freeBuffer(); }
   while(chirpQueueR.available()) { chirpQueueR.freeBuffer(); }
-  searchHead=0; samplesInRing=0; samplesSinceSearch=0; leftRingSum=0.0; lastRoughCorrelation=0; lastBeatHz=0;
+  searchHead=0; samplesInRing=0; samplesSinceSearch=0;
+  leftRingSum=0.0; leftRingSumSq=0.0;
+  lastRoughCorrelation=0; lastBeatHz=0;
   memset(leftRingBuf,0,sizeof(leftRingBuf));
   memset(rightRingBuf,0,sizeof(rightRingBuf));
   memset(g_capL,0,sizeof(g_capL)); memset(g_capR,0,sizeof(g_capR));
@@ -1018,7 +1030,10 @@ static bool micGetBlock() {
     int16_t *l=chirpQueueL.readBuffer(); int16_t *r=chirpQueueR.readBuffer();
     for(int i=0;i<AUDIO_BLOCK_SAMPLES;i++) {
       float lf=(float)l[i]/32768.0f, rf=(float)r[i]/32768.0f;
-      leftRingSum -= leftRingBuf[searchHead]; leftRingBuf[searchHead]=lf; leftRingSum += lf;
+      const float old=leftRingBuf[searchHead];
+      leftRingSum   += (double)lf - (double)old;
+      leftRingSumSq += (double)lf*(double)lf - (double)old*(double)old;
+      leftRingBuf[searchHead]=lf;
       rightRingBuf[searchHead]=rf;
       searchHead=(searchHead+1)%CHIRP_SAMPLES;
       if(samplesInRing<CHIRP_SAMPLES) samplesInRing++;
@@ -1030,16 +1045,33 @@ static bool micGetBlock() {
 }
 static float roughCorrelation() {
   if(samplesInRing<CHIRP_SAMPLES || refEnergy<=DSP_EPS) return 0.0f;
-  float mean=(float)(leftRingSum/(double)CHIRP_SAMPLES);
-  float accReal=0.0f, accImag=0.0f, energy=0.0f;
-  for(uint32_t n=0;n<CHIRP_SAMPLES;n++) {
-    uint32_t at=(searchHead+n)%CHIRP_SAMPLES; 
-    float rx=leftRingBuf[at]-mean;
-    accReal += rx * real_ref[n]; accImag += rx * imag_ref[n]; energy += rx*rx;
-    if((n&4095u)==0) feedWatchdog();
+
+  const double N    = (double)CHIRP_SAMPLES;
+  const double mean = leftRingSum / N;
+  double energy     = leftRingSumSq - N*mean*mean;   // sum((x-mean)^2)
+  if(energy <= 1.0e-9) return 0.0f;                  // silence / cancellation floor
+
+  // Ring is oldest-first starting at searchHead. Reference index n pairs with
+  // ring index (searchHead+n) % N, so split into two contiguous segments:
+  //   seg1: ring[searchHead .. N-1]  <-> ref[0 .. n1-1]
+  //   seg2: ring[0 .. searchHead-1]  <-> ref[n1 .. N-1]
+  const uint32_t n1 = CHIRP_SAMPLES - searchHead;
+  float re1=0.0f, im1=0.0f, re2=0.0f, im2=0.0f;
+
+  arm_dot_prod_f32(&leftRingBuf[searchHead], &real_ref[0], n1, &re1);
+  arm_dot_prod_f32(&leftRingBuf[searchHead], &imag_ref[0], n1, &im1);
+  if(searchHead > 0) {
+    arm_dot_prod_f32(&leftRingBuf[0], &real_ref[n1], searchHead, &re2);
+    arm_dot_prod_f32(&leftRingBuf[0], &imag_ref[n1], searchHead, &im2);
   }
-  float magnitude = sqrtf(accReal * accReal + accImag * accImag);
-  return magnitude / (sqrtf(energy * refEnergy) + DSP_EPS);
+  feedWatchdog();
+
+  // sum((x-mean)*ref) = sum(x*ref) - mean*sum(ref)
+  const double accReal = (double)re1 + (double)re2 - mean*refSumReal;
+  const double accImag = (double)im1 + (double)im2 - mean*refSumImag;
+
+  const double mag = sqrt(accReal*accReal + accImag*accImag);
+  return (float)(mag / (sqrt(energy*(double)refEnergy) + (double)DSP_EPS));
 }
 // Capture the final 4096 samples in chronological order before FFT overwrites rings.
 static void captureTdoaWindow() {
@@ -1121,7 +1153,7 @@ static bool dechirp() {
       chirpQueueR.freeBuffer();
   }
   Serial.printf("[mic] dechirp: 3\n");
-  searchHead=0; samplesInRing=0; samplesSinceSearch=0; leftRingSum=0.0;
+  searchHead=0; samplesInRing=0; samplesSinceSearch=0; leftRingSum=0.0;  leftRingSumSq=0.0;
   memset(leftRingBuf,0,sizeof(leftRingBuf)); memset(rightRingBuf,0,sizeof(rightRingBuf));
   chirpQueueL.begin(); chirpQueueR.begin(); micQueueRunning=true;
   Serial.printf("[mic] dechirp: end fftValid=%d\n", fftValid);
