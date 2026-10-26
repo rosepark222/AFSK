@@ -892,7 +892,7 @@ static constexpr float MIC_FS = 44100.0f;
 static constexpr uint32_t CHIRP_SAMPLES = 32768;
 static constexpr uint32_t FFT_N = 4096;
 static constexpr uint32_t NUM_ROWS = 8;
-static constexpr uint32_t SEARCH_STEP_N = 128; // 512;
+static constexpr uint32_t SEARCH_STEP_N = 64; // 128; // 512;
 static constexpr float ROUGH_SEARCH_THRESHOLD = 0.10f;
 static constexpr float FINE_SEARCH_THRESHOLD = 0.40f; 
 static constexpr float PEAK_SEARCH_MAX_HZ = 300.0f;
@@ -1022,26 +1022,39 @@ static void micFlush() {
   memset(g_capL,0,sizeof(g_capL)); memset(g_capR,0,sizeof(g_capR));
   if(micDspReady) { chirpQueueL.begin(); chirpQueueR.begin(); micQueueRunning=true; }
 }
-// Read at least one paired 128-sample block, preserving stereo sample alignment.
-static bool micGetBlock() {
-  if(!micQueueRunning) return false;
-  bool got=false;
-  while(chirpQueueL.available() && chirpQueueR.available()) {
-    int16_t *l=chirpQueueL.readBuffer(); int16_t *r=chirpQueueR.readBuffer();
-    for(int i=0;i<AUDIO_BLOCK_SAMPLES;i++) {
-      float lf=(float)l[i]/32768.0f, rf=(float)r[i]/32768.0f;
-      const float old=leftRingBuf[searchHead];
-      leftRingSum   += (double)lf - (double)old;
-      leftRingSumSq += (double)lf*(double)lf - (double)old*(double)old;
-      leftRingBuf[searchHead]=lf;
-      rightRingBuf[searchHead]=rf;
-      searchHead=(searchHead+1)%CHIRP_SAMPLES;
-      if(samplesInRing<CHIRP_SAMPLES) samplesInRing++;
-      samplesSinceSearch++;
-    }
-    chirpQueueL.freeBuffer(); chirpQueueR.freeBuffer(); got=true;
+
+static int16_t* pendL = nullptr;       // block currently being consumed
+static int16_t* pendR = nullptr;
+static uint32_t pendOff = 0;           // next unread sample in that block
+
+static void micDropPending() {
+  if (pendL) { chirpQueueL.freeBuffer(); chirpQueueR.freeBuffer(); }
+  pendL = pendR = nullptr; pendOff = 0;
+}
+
+// Copy exactly 64 samples (half a block) into the ring. Returns false if no data.
+static bool micGetStep() {
+  if (!micQueueRunning) return false;
+  if (!pendL) {
+    if (!(chirpQueueL.available() && chirpQueueR.available())) return false;
+    pendL = chirpQueueL.readBuffer();
+    pendR = chirpQueueR.readBuffer();
+    pendOff = 0;
   }
-  return got;
+  for (uint32_t i = pendOff; i < pendOff + 64; i++) {
+    float lf = (float)pendL[i] / 32768.0f, rf = (float)pendR[i] / 32768.0f;
+    const float old = leftRingBuf[searchHead];
+    leftRingSum   += (double)lf - (double)old;
+    leftRingSumSq += (double)lf*(double)lf - (double)old*(double)old;
+    leftRingBuf[searchHead]  = lf;
+    rightRingBuf[searchHead] = rf;
+    searchHead = (searchHead + 1) % CHIRP_SAMPLES;
+    if (samplesInRing < CHIRP_SAMPLES) samplesInRing++;
+    samplesSinceSearch++;
+  }
+  pendOff += 64;
+  if (pendOff >= AUDIO_BLOCK_SAMPLES) micDropPending();   // block fully consumed
+  return true;
 }
 static float roughCorrelation() {
   if(samplesInRing<CHIRP_SAMPLES || refEnergy<=DSP_EPS) return 0.0f;
@@ -1224,7 +1237,7 @@ private:
     while (!deadlinePassed()) {
       feedWatchdog();
       stage_ = WAITING;
-      if (!micGetBlock()) continue;
+      if (!micGetStep()) continue;
       stage_ = ROUGH;  // Diagnostics: dechirp pipeline active
       if (!dechirp()) continue;
       micStop();
