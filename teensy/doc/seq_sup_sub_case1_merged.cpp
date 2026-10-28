@@ -892,8 +892,8 @@ static constexpr float MIC_FS = 44100.0f;
 static constexpr uint32_t CHIRP_SAMPLES = 32768;
 static constexpr uint32_t FFT_N = 4096;
 static constexpr uint32_t NUM_ROWS = 8;
-static constexpr uint32_t SEARCH_STEP_N = 64; // 128; // 512;
-static constexpr float ROUGH_SEARCH_THRESHOLD = 0.10f;
+static constexpr uint32_t SEARCH_STEP_N = 64; // hop-8=100k budget hop-64=870K budget --- measured 500K cycles
+static constexpr float ROUGH_SEARCH_THRESHOLD = 0.20f;
 static constexpr float FINE_SEARCH_THRESHOLD = 0.40f; 
 static constexpr float PEAK_SEARCH_MAX_HZ = 300.0f;
 static constexpr float DETECT_RATIO_THRESHOLD = 1.2f; // 5.0f;
@@ -1056,6 +1056,7 @@ static bool micGetStep() {
   if (pendOff >= AUDIO_BLOCK_SAMPLES) micDropPending();   // block fully consumed
   return true;
 }
+
 static float roughCorrelation() {
   if(samplesInRing<CHIRP_SAMPLES || refEnergy<=DSP_EPS) return 0.0f;
 
@@ -1140,22 +1141,87 @@ static bool fineCorrelation() {
   Serial.printf("[mic] fine analytic correlation=%.4f\n",best);
   return best >= FINE_SEARCH_THRESHOLD;
 }
+
+#define CHIRP_DIAG 1
+static constexpr int32_t DIAG_MAX_LAG = 512;
+
+static void diagFineProfile() {
+  static float c[2*DIAG_MAX_LAG + 1];
+  float rxMean = (float)(leftRingSum / (double)CHIRP_SAMPLES);
+  uint32_t t0 = millis();
+  for(int32_t lag=-DIAG_MAX_LAG; lag<=DIAG_MAX_LAG; lag++) {
+    float ii=0, qq=0, ee=0;
+    for(int32_t n=(lag>0?lag:0); n<(int32_t)CHIRP_SAMPLES+(lag<0?lag:0); n++) {
+      int32_t ix = n - lag;                       // always inside 0..N-1 by the loop bounds
+      float rx = leftRingBuf[(searchHead + (uint32_t)ix) % CHIRP_SAMPLES] - rxMean;
+      ii += real_ref[n]*rx; qq += imag_ref[n]*rx; ee += rx*rx;
+    }
+    c[lag+DIAG_MAX_LAG] = sqrtf(ii*ii+qq*qq) / (sqrtf(ee*refEnergy) + DSP_EPS);
+    if((lag & 15) == 0) feedWatchdog();
+  }
+  Serial.printf("[diag] %lu ms. local maxima (lag: corr):\n", (unsigned long)(millis()-t0));
+  for(int32_t i=1; i<2*DIAG_MAX_LAG; i++)
+    //if(c[i]>0.1f && c[i]>=c[i-1] && c[i]>c[i+1])
+      Serial.printf("  %ld: %.3f\n", (long)(i-DIAG_MAX_LAG), c[i]);
+}
+
+static constexpr uint8_t ROUGH_FOLLOW_HOPS = 5;      // correlations after the first crossing
+static constexpr float   ROUGH_PEAK_ACCEPT = 0.30f;  // peak within the window must reach this
+
+static bool    roughArmed  = false;
+static uint8_t roughCount  = 0;      // follow-up hops done
+static float   roughMax    = 0.0f;
+static uint8_t roughMaxIdx = 0;      // 0 = the first crossing, 1..5 = follow-up hops
+
 static bool dechirp() {
   if(!micDspReady || samplesInRing<CHIRP_SAMPLES || samplesSinceSearch<SEARCH_STEP_N) return false;
   samplesSinceSearch=0;
+  
+  uint32_t start = ARM_DWT_CYCCNT;
   lastRoughCorrelation=roughCorrelation();
-  if(lastRoughCorrelation<ROUGH_SEARCH_THRESHOLD) { return false; } 
-  else { Serial.printf("[mic] dechirp:   lastRoughCorrelation=%.4f\n", lastRoughCorrelation); }
+  uint32_t cycles = ARM_DWT_CYCCNT - start;
+  Serial.printf("roughCorrelation %.4f took %u cycles (870K cycles budget for hop-64 correlation)\n",lastRoughCorrelation, cycles);
+
+  if(!roughArmed) {
+    if(lastRoughCorrelation < ROUGH_SEARCH_THRESHOLD) return false;
+    roughArmed  = true;                    // first crossing
+    roughCount  = 0;
+    roughMax    = lastRoughCorrelation;
+    roughMaxIdx = 0;
+    Serial.printf("[mic] dechirp: armed, corr=%.4f\n", roughMax);
+    return false;
+  }
+
+  // follow-up hop
+  roughCount++;
+  if(lastRoughCorrelation > roughMax) { roughMax = lastRoughCorrelation; roughMaxIdx = roughCount; }
+  //Serial.printf("[mic] dechirp: follow %u/%u corr=%.4f\n", roughCount, ROUGH_FOLLOW_HOPS, lastRoughCorrelation);
+  if(roughCount < ROUGH_FOLLOW_HOPS) return false;
+
+  // window complete: decide
+  roughArmed = false;
+  const bool peaked = (roughMaxIdx < ROUGH_FOLLOW_HOPS);   // maximum was not the last hop, so it has fallen
+  Serial.printf("[mic] dechirp: peak=%.4f at hop %u (%u hops ago), peaked=%d\n",
+                roughMax, roughMaxIdx, ROUGH_FOLLOW_HOPS - roughMaxIdx, peaked);
+  if(roughMax < ROUGH_PEAK_ACCEPT || !peaked) return false;
+
+
+
+#if CHIRP_DIAG
+  diagFineProfile();           // ring is intact here
+#endif
+
 
   // Keep both channels aligned for TDOA before mixFFT destroys the ring buffers.
   captureTdoaWindow();
   //if(!fineCorrelation()) return false;
 
-  bool fftValid=mixFFT();
-  Serial.printf("[mic] dechirp: 1\n");
+  bool fftValid = true ; // mixFFT();
+
+  //Serial.printf("[mic] dechirp: 1\n");
   // Restart from a clean buffer after a candidate, regardless of FFT decision.
   if(micQueueRunning) { chirpQueueL.end(); chirpQueueR.end(); micQueueRunning=false; }
-  Serial.printf("[mic] dechirp: 2\n");
+  //Serial.printf("[mic] dechirp: 2\n");
   // Correct way to flush a Teensy audio record queue
   while (chirpQueueL.available() > 0) {
       chirpQueueL.readBuffer(); // Consume the data pointer
@@ -1165,7 +1231,7 @@ static bool dechirp() {
       chirpQueueR.readBuffer();
       chirpQueueR.freeBuffer();
   }
-  Serial.printf("[mic] dechirp: 3\n");
+  //Serial.printf("[mic] dechirp: 3\n");
   searchHead=0; samplesInRing=0; samplesSinceSearch=0; leftRingSum=0.0;  leftRingSumSq=0.0;
   memset(leftRingBuf,0,sizeof(leftRingBuf)); memset(rightRingBuf,0,sizeof(rightRingBuf));
   chirpQueueL.begin(); chirpQueueR.begin(); micQueueRunning=true;
@@ -1758,7 +1824,7 @@ private:
 // SEQUENCES erp029
 // Step = { prim, param, timeout_ms, onFail, gotoIdx }
 // ============================================================================
-#define ROBOT_ROLE 1       // change to 2 for the other robot
+#define ROBOT_ROLE 2       // change to 2 for the other robot
 
 //#if ROBOT_ROLE == ROBOT_B
 
