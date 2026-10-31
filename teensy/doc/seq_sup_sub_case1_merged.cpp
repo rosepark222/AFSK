@@ -55,7 +55,7 @@ namespace cfg {
 
   // acoustics
   constexpr float SPEED_OF_SOUND_MPS = 343.0f;
-  constexpr float MIC_SPACING_M      = 0.10f;   // TODO: your mic baseline
+  constexpr float MIC_SPACING_M      = 0.15f;   // TODO: your mic baseline
   constexpr float BEARING_AGREE_DEG  = 30.0f;
 
   // audio library memory blocks (shared by everything that uses the Audio library).
@@ -1122,48 +1122,52 @@ static bool mixFFT() {
   Serial.printf("[mic] mixFFT: rough=%.4f beat=%.3f Hz peak/runner-up=%.2f\n",lastRoughCorrelation,lastBeatHz,ratio);
   return isfinite(best) && best>DSP_EPS && ratio>=DETECT_RATIO_THRESHOLD;
 }
-// Fine analytic correlation checks the chirp around the rough alignment. The
-// rough full-window normalized correlation is retained as the first validation.
-static bool fineCorrelation() {
-  float best=0.0f; float rxMean=0.0f;
-  for(uint32_t n=0;n<CHIRP_SAMPLES;n++) rxMean+=leftRingBuf[(searchHead+n)%CHIRP_SAMPLES];
-  rxMean/=CHIRP_SAMPLES;
-  for(int32_t lag=-(int32_t)FINE_XCORR_MAX_LAG;lag<=(int32_t)FINE_XCORR_MAX_LAG;lag++) {
-    float ii=0.0f,qq=0.0f,ee=0.0f;
-    for(uint32_t n=0;n<CHIRP_SAMPLES;n++) {
-      int32_t ix=(int32_t)n-lag; if(ix<0 || ix>=(int32_t)CHIRP_SAMPLES) continue;
-      float rx=leftRingBuf[(searchHead+(uint32_t)ix)%CHIRP_SAMPLES]-rxMean;
-      ii+=real_ref[n]*rx; qq+=imag_ref[n]*rx; ee+=rx*rx;
-    }
-    float a=sqrtf(ii*ii+qq*qq)/(sqrtf(ee*refEnergy)+DSP_EPS); if(a>best)best=a;
-    if((lag&15)==0) feedWatchdog();
-  }
-  Serial.printf("[mic] fine analytic correlation=%.4f\n",best);
-  return best >= FINE_SEARCH_THRESHOLD;
-}
 
 #define CHIRP_DIAG 1
 static constexpr int32_t DIAG_MAX_LAG = 512;
-
-static void diagFineProfile() {
-  static float c[2*DIAG_MAX_LAG + 1];
-  float rxMean = (float)(leftRingSum / (double)CHIRP_SAMPLES);
-  uint32_t t0 = millis();
-  for(int32_t lag=-DIAG_MAX_LAG; lag<=DIAG_MAX_LAG; lag++) {
-    float ii=0, qq=0, ee=0;
-    for(int32_t n=(lag>0?lag:0); n<(int32_t)CHIRP_SAMPLES+(lag<0?lag:0); n++) {
-      int32_t ix = n - lag;                       // always inside 0..N-1 by the loop bounds
-      float rx = leftRingBuf[(searchHead + (uint32_t)ix) % CHIRP_SAMPLES] - rxMean;
-      ii += real_ref[n]*rx; qq += imag_ref[n]*rx; ee += rx*rx;
-    }
-    c[lag+DIAG_MAX_LAG] = sqrtf(ii*ii+qq*qq) / (sqrtf(ee*refEnergy) + DSP_EPS);
-    if((lag & 15) == 0) feedWatchdog();
-  }
-  Serial.printf("[diag] %lu ms. local maxima (lag: corr):\n", (unsigned long)(millis()-t0));
-  for(int32_t i=1; i<2*DIAG_MAX_LAG; i++)
-    //if(c[i]>0.1f && c[i]>=c[i-1] && c[i]>c[i+1])
-      Serial.printf("  %ld: %.3f\n", (long)(i-DIAG_MAX_LAG), c[i]);
+static double sumRing(const float* ring) {
+  double s = 0;
+  for (uint32_t i = 0; i < CHIRP_SAMPLES; i++) s += ring[i];
+  return s;
 }
+ 
+static constexpr int32_t PROF_LAGS = 512;
+static float profL[PROF_LAGS + 1], profR[PROF_LAGS + 1];
+
+static void fineProfile(const float* ring, double ringSum, float* out) {   // out[lag], lag = 0..512
+  const float rxMean = (float)(ringSum / (double)CHIRP_SAMPLES);
+  for (int32_t lag = 0; lag <= PROF_LAGS; lag++) {
+    float ii = 0, qq = 0, ee = 0;
+    for (int32_t n = lag; n < (int32_t)CHIRP_SAMPLES; n++) {
+      float rx = ring[(searchHead + (uint32_t)(n - lag)) % CHIRP_SAMPLES] - rxMean;
+      ii += real_ref[n] * rx; qq += imag_ref[n] * rx; ee += rx * rx;
+    }
+    out[lag] = sqrtf(ii*ii + qq*qq) / (sqrtf(ee * refEnergy) + DSP_EPS);
+    if ((lag & 15) == 0) feedWatchdog();
+  }
+}
+
+static float flankMidLag(const float* mag, int32_t n, int32_t iMax, float lag0) {
+  float peak = mag[iMax], sum = 0; int cnt = 0;
+  for (float f = 0.97f; f >= 0.749f; f -= 0.05f) {
+    float lvl = f * peak;
+    int32_t a = iMax, b = iMax;
+    while (a > 0     && mag[a] > lvl) a--;
+    while (b < n - 1 && mag[b] > lvl) b++;
+    if (a == 0 || b == n - 1) continue;               // flank left the search window
+    float la = a + (lvl - mag[a]) / (mag[a+1] - mag[a]);    // linear interpolation
+    float lb = b - (lvl - mag[b]) / (mag[b-1] - mag[b]);
+    sum += 0.5f * (la + lb); cnt++;
+  }
+  return lag0 + (cnt ? sum / cnt : (float)iMax);
+}
+
+static float peakLagFromProfile(const float* mag, int32_t n, float lag0) {
+  int32_t iMax = 0;
+  for (int32_t i = 1; i < n; i++) if (mag[i] > mag[iMax]) iMax = i;   // coarse peak
+  return flankMidLag(mag, n, iMax, lag0);                              // refined lag, in samples
+}
+
 
 static constexpr uint8_t ROUGH_FOLLOW_HOPS = 5;      // correlations after the first crossing
 static constexpr float   ROUGH_PEAK_ACCEPT = 0.30f;  // peak within the window must reach this
@@ -1173,7 +1177,7 @@ static uint8_t roughCount  = 0;      // follow-up hops done
 static float   roughMax    = 0.0f;
 static uint8_t roughMaxIdx = 0;      // 0 = the first crossing, 1..5 = follow-up hops
 
-static bool dechirp() {
+static bool dechirp(Context* ctx) {
   if(!micDspReady || samplesInRing<CHIRP_SAMPLES || samplesSinceSearch<SEARCH_STEP_N) return false;
   samplesSinceSearch=0;
   
@@ -1208,7 +1212,33 @@ static bool dechirp() {
 
 
 #if CHIRP_DIAG
-  diagFineProfile();           // ring is intact here
+  // static float lc[2*DIAG_MAX_LAG + 1];
+  // static float rc[2*DIAG_MAX_LAG + 1];
+  // diagFineProfile(leftRingBuf,  leftRingSum,           lc,  "L");
+  // diagFineProfile(rightRingBuf, sumRing(rightRingBuf), rc,  "R");
+
+  // for(int32_t i=DIAG_MAX_LAG; i<=2*DIAG_MAX_LAG; i++)
+  //   Serial.printf("  %ld, %.3f, %.3f\n", (long)(i-DIAG_MAX_LAG), lc[i], rc[i]);
+
+fineProfile(leftRingBuf,  leftRingSum,           profL);
+fineProfile(rightRingBuf, sumRing(rightRingBuf), profR);   // sumRing() from before
+float lagL = peakLagFromProfile(profL, PROF_LAGS + 1, 0.0f);
+float lagR = peakLagFromProfile(profR, PROF_LAGS + 1, 0.0f);
+float dtSamples = lagL - lagR;                  // positive: left leads
+float dt = dtSamples / MIC_FS;
+float dd = cfg::SPEED_OF_SOUND_MPS * dt;
+float arcsin = dd / cfg::MIC_SPACING_M;
+arcsin = arcsin < -1.0 ? -1.0 : arcsin;
+arcsin = arcsin > 1.0 ? 1.0 : arcsin;
+float angleRad = asin(arcsin); 
+float angleDeg = angleRad * (180.0 / PI);
+for(int32_t i=0; i<=PROF_LAGS; i++)
+  Serial.printf("  %d, %.3f, %.3f\n", i, profL[i], profR[i]);
+Serial.printf("  lagL=%.3f, lagR=%.3f, dt=%.6f,  dd=%.3f, arcsin=%.3f, angleRad=%.3f, angleDeg=%.3f\n", 
+                lagL, lagR, dt, dd, arcsin, angleRad, angleDeg);
+
+ctx->bearing = -1*angleDeg; // negate to turn toward the sound
+
 #endif
 
 
@@ -1282,7 +1312,6 @@ public:
   Result update() override {
     switch (st_) {
       case LISTEN_CHIRP: return listenChirp();
-      case COMPUTE_TDOA: return computeTdoa();
       case LISTEN_AFSK:  return listenAfsk();
       default:           return Result::FAIL;
     }
@@ -1305,25 +1334,13 @@ private:
       stage_ = WAITING;
       if (!micGetStep()) continue;
       stage_ = ROUGH;  // Diagnostics: dechirp pipeline active
-      if (!dechirp()) continue;
+      if (!dechirp(ctx_)) continue;
       micStop();
       Serial.printf("[mic] listenChirp: end\n");
       return Result::SUCCESS;  // Capture buffers now hold the chirp
     }
     micStop();
     return Result::TIMEOUT;
-  }
-
-  Result computeTdoa() {
-    float dt;
-    if (!micTdoaSeconds(dt)) return Result::FAIL;
-    float s = cfg::SPEED_OF_SOUND_MPS * dt / cfg::MIC_SPACING_M;
-    if (s >  1.0f) s =  1.0f;
-    if (s < -1.0f) s = -1.0f;
-    float deg = asinf(s) * 180.0f / (float)M_PI;   // TODO: confirm sign vs gyro (CCW +)
-    if ((int)param_ == 1) ctx_->theta1 = deg;
-    else                  ctx_->theta2 = deg;
-    return Result::SUCCESS;
   }
 
   Result listenAfsk() {
@@ -1720,7 +1737,8 @@ private:
       if (!cmdToStep(ctx->rxCmd, s)) return false;
     }
     if (s.prim == Prim::TURN && isnan(s.param))
-      s.param = wrap180(ctx->bearing - chassis_.yawDeg());   // relative turn to the world bearing
+      // s.param = wrap180(ctx->bearing - chassis_.yawDeg());   // relative turn to the world bearing
+      s.param = wrap180(ctx->bearing);     // no gyro: bearing is the relative turn needed from the current pose
     return true;
   }
 
@@ -1932,7 +1950,9 @@ static const Step SEQ_LISTEN_CHIRP[] = {
   { Prim::LCD1_OFF,        0,  5000, OnFail::ABORT, 0 }, // play yes and abort the seq if play gets timed out
   { Prim::LISTEN_CHIRP,    0,  100000, OnFail::ABORT, 0 },   // 4
   { Prim::LCD1_ON,         0,  5000, OnFail::ABORT, 0 }, // play yes and abort the seq if play gets timed out
- 
+  { Prim::WAIT,            0,   1000, OnFail::ABORT, 0 },   // 3  settle (overlaps the superstructure settle)
+  { Prim::TURN,            NAN,   3000, OnFail::ABORT, 0 },   // 7  NAN = use ctx.bearing
+
 };
 
 static const Step SEQ_LISTEN_AFSK[] = {
