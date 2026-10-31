@@ -2,6 +2,7 @@
 #include <Arduino.h>
 #include <Audio.h>
 #include <SD.h>
+#include <MTP_Teensy.h>
 #include <arm_math.h>
 #include <arm_const_structs.h>
 #include <math.h>
@@ -345,11 +346,10 @@ public:
       st_ = CHIRP;
     } else if (s.prim == Prim::PLAY_WAVE) {
       const char* filename = getWaveFilename(s.param);
-      if (playWav1.play(filename)) {
-        Serial.printf("[speaker] Playing file: %s\n", filename);
-      } else {
-        Serial.printf("[speaker] Error: Failed to play %s\n", filename);
-      }
+      waveFailed_  = !playWav1.play(filename);
+      waveStarted_ = false;
+      waveStartMs_ = millis();
+      Serial.printf("[speaker] %s: %s\n", waveFailed_ ? "FAILED to open" : "Playing file", filename);
       st_ = WAVE;
       
     } else {                                       // SEND_AFSK
@@ -363,12 +363,15 @@ public:
     if (st_ == IDLE) return Result::SUCCESS;
 
     if (st_ == WAVE) {
-        if (!playWav1.isPlaying()) {
-          playWav1.stop();
-          st_ = IDLE;
-          return Result::SUCCESS; // File finished playing naturally
-        }
-        return Result::RUNNING;
+      if (waveFailed_) { st_ = IDLE; return Result::FAIL; }            // file didn't open
+      if (playWav1.isPlaying()) { waveStarted_ = true; return Result::RUNNING; }
+      if (!waveStarted_ && (millis() - waveStartMs_) < 500)
+        return Result::RUNNING;                                        // header still being parsed
+      playWav1.stop();
+      st_ = IDLE;
+      Serial.printf("[speaker] wave done after %lu ms, started=%d\n",
+                    (unsigned long)(millis() - waveStartMs_), (int)waveStarted_);
+      return waveStarted_ ? Result::SUCCESS : Result::FAIL;            // never started: bad file
     }
 
     if ((int32_t)(millis() - endMs_) >= 0) {       // transmission time elapsed
@@ -385,6 +388,9 @@ public:
 private:
   enum St : uint8_t { IDLE, CHIRP, AFSK, WAVE} st_ = IDLE;
   uint32_t endMs_ = 0;
+  bool     waveFailed_  = false;
+  bool     waveStarted_ = false;
+  uint32_t waveStartMs_ = 0;
 };
 
 // ============================================================================
@@ -973,6 +979,7 @@ static inline void dft8(float *re, float *im) {
   re[2]=er[2]+w2r; im[2]=ei[2]+w2i; re[6]=er[2]-w2r; im[6]=ei[2]-w2i;
   re[3]=er[3]+w3r; im[3]=ei[3]+w3i; re[7]=er[3]-w3r; im[7]=ei[3]-w3i;
 }
+
 static void fft32768(float *re, float *im) {
   for(uint32_t row=0;row<NUM_ROWS;row++) {
     for(uint32_t n=0;n<FFT_N;n++){ rowBuf[2*n]=re[NUM_ROWS*n+row]; rowBuf[2*n+1]=im[NUM_ROWS*n+row]; }
@@ -992,28 +999,78 @@ static void fft32768(float *re, float *im) {
   }
 }
 
+// Analytic reference z[n] = w[n] * exp(j*phi[n]), built with the same phase law as spkGenerateChirp().
+// Put this in the mic section, above micBegin().
+static void buildChirpReference() {
+  const double fs        = (double)SPK_CHIRP_SAMPLE_RATE;
+  const double bandwidth = (double)(SPK_CHIRP_F_END - SPK_CHIRP_F_START);
+  const double slotWidth = bandwidth / (double)SPK_CHIRP_NUM_SLOTS;
+  const double f0        = (double)SPK_CHIRP_F_START + (double)SPK_CHIRP_ID * slotWidth;
+  const double k         = bandwidth / ((double)CHIRP_SAMPLES / fs);   // sweep rate in Hz/s
+  double phase = 0.0;
+  for (uint32_t n = 0; n < CHIRP_SAMPLES; ++n) {
+    double freq = f0 + k * ((double)n / fs);
+    if (freq > (double)SPK_CHIRP_F_END) freq -= bandwidth;
+    phase += 2.0 * M_PI * freq / fs;
+    if (phase > 2.0 * M_PI) phase -= 2.0 * M_PI;
+    const double w = 0.5 * (1.0 - cos(2.0 * M_PI * (double)n / (double)(CHIRP_SAMPLES - 1)));
+    real_ref[n] = (float)(w * cos(phase));
+    imag_ref[n] = (float)(w * sin(phase));
+  }
+}
+
+static_assert(CHIRP_SAMPLES == SPK_CHIRP_SAMPLES, "mic reference and speaker chirp must have the same length");
+
 static void micBegin() {
   if (!SD.begin(BUILTIN_SDCARD)) { Serial.println("[mic] SD.begin failed; chirp detection disabled"); return; }
   buildTwiddles();
   memset(leftRingBuf,0,sizeof(leftRingBuf)); memset(rightRingBuf,0,sizeof(rightRingBuf));
   leftRingSum = 0.0; leftRingSumSq = 0.0;
-  int nr=loadFloatFile(FILE_REAL_REF,real_ref,CHIRP_SAMPLES);
-  int ni=loadFloatFile(FILE_IMAG_REF,imag_ref,CHIRP_SAMPLES);
+  // int nr=loadFloatFile(FILE_REAL_REF,real_ref,CHIRP_SAMPLES);
+  // int ni=loadFloatFile(FILE_IMAG_REF,imag_ref,CHIRP_SAMPLES);
+  buildChirpReference();
   refEnergy=0.0f; refSumReal=0.0; refSumImag=0.0;
   for(uint32_t i=0;i<CHIRP_SAMPLES;i++) {
     refEnergy  += real_ref[i]*real_ref[i];
     refSumReal += (double)real_ref[i];
     refSumImag += (double)imag_ref[i];
   }
-  micDspReady=(nr==(int)CHIRP_SAMPLES && ni==(int)CHIRP_SAMPLES && refEnergy>DSP_EPS);
-  Serial.printf("[mic] reference samples real=%d imag=%d energy=%.6f sumRe=%.4f sumIm=%.4f; DSP %s\n",
-                nr,ni,refEnergy,refSumReal,refSumImag,micDspReady?"ready":"disabled");
+  micDspReady = (refEnergy > DSP_EPS);
+  Serial.printf("[mic] reference generated: energy=%.6f sumRe=%.4f sumIm=%.4f; DSP %s\n",
+                refEnergy, refSumReal, refSumImag, micDspReady ? "ready" : "disabled");
+}
+
+static int16_t* pendL = nullptr;       // block currently being consumed
+static int16_t* pendR = nullptr;
+static uint32_t pendOff = 0;           // next unread sample in that block
+
+static void micDrainQueues() {
+  // Why readBuffer() is needed
+  // available() just computes head - tail, the count of blocks waiting. It doesn’t free anything.
+  // readBuffer() advances tail (the thing that makes available() drop) and stores that block in userblock.
+  // freeBuffer() only releases userblock, and returns immediately if userblock == NULL. It never touches tail.
+ 
+  // Correct way to flush a Teensy audio record queue
+  // while (chirpQueueL.available() > 0) {
+  //     chirpQueueL.readBuffer(); // Consume the data pointer
+  //     chirpQueueL.freeBuffer(); // Release the block back to the audio memory pool
+  // }
+  // while (chirpQueueR.available() > 0) {
+  //     chirpQueueR.readBuffer();
+  //     chirpQueueR.freeBuffer();
+  // }
+
+  // Simplest fix
+  // AudioRecordQueue has a clear() method for this. It releases userblock and 
+  // every queued block and moves tail up to head. You already use it in afskStart() 
+  // and afskStop(). Replace those loops with it:
+  chirpQueueL.clear();
+  chirpQueueR.clear();
+  pendL = pendR = nullptr; pendOff = 0;      // clear() already released them; don't free again
 }
 
 static void micFlush() {
-  if (micQueueRunning) { chirpQueueL.end(); chirpQueueR.end(); micQueueRunning=false; }
-  while(chirpQueueL.available()) { chirpQueueL.freeBuffer(); }
-  while(chirpQueueR.available()) { chirpQueueR.freeBuffer(); }
+  micStop();
   searchHead=0; samplesInRing=0; samplesSinceSearch=0;
   leftRingSum=0.0; leftRingSumSq=0.0;
   lastRoughCorrelation=0; lastBeatHz=0;
@@ -1023,9 +1080,7 @@ static void micFlush() {
   if(micDspReady) { chirpQueueL.begin(); chirpQueueR.begin(); micQueueRunning=true; }
 }
 
-static int16_t* pendL = nullptr;       // block currently being consumed
-static int16_t* pendR = nullptr;
-static uint32_t pendOff = 0;           // next unread sample in that block
+
 
 static void micDropPending() {
   if (pendL) { chirpQueueL.freeBuffer(); chirpQueueR.freeBuffer(); }
@@ -1094,34 +1149,34 @@ static void captureTdoaWindow() {
 }
 // Mix rx with the real/Hilbert reference, perform the 32768-point FFT, and
 // require a dominant low-frequency beat peak before accepting the chirp.
-static bool mixFFT() {
-  float mean=(float)(leftRingSum/(double)CHIRP_SAMPLES);
-  for(uint32_t n=0;n<CHIRP_SAMPLES;n++) {
-    uint32_t at=(searchHead+n)%CHIRP_SAMPLES; float rx=leftRingBuf[at]-mean;
-    rightRingBuf[n]=rx; if((n&4095u)==0) feedWatchdog();
-  }
-  for(uint32_t n=0;n<CHIRP_SAMPLES;n++){float rx=rightRingBuf[n];leftRingBuf[n]=rx*real_ref[n];rightRingBuf[n]=-rx*imag_ref[n];}
-  fft32768(leftRingBuf,rightRingBuf);
-  uint32_t maxBin=(uint32_t)(PEAK_SEARCH_MAX_HZ*CHIRP_SAMPLES/MIC_FS);
-  float best=0.0f, second=0.0f; int32_t bestK=0;
-  for(int32_t k=-(int32_t)maxBin;k<=(int32_t)maxBin;k++) {
-    uint32_t bin=(uint32_t)((k+(int32_t)CHIRP_SAMPLES)%(int32_t)CHIRP_SAMPLES);
-    float v=sqrtf(leftRingBuf[bin]*leftRingBuf[bin]+rightRingBuf[bin]*rightRingBuf[bin]);
-    if(v>best){best=v;bestK=k;}
-  }
-  // Exclude the peak and its two adjacent bins from the competitor search;
-  // otherwise spectral leakage from the same peak makes the ratio meaningless.
-  for(int32_t k=-(int32_t)maxBin;k<=(int32_t)maxBin;k++) {
-    if(abs(k-bestK)<=2) continue;
-    uint32_t bin=(uint32_t)((k+(int32_t)CHIRP_SAMPLES)%(int32_t)CHIRP_SAMPLES);
-    float v=sqrtf(leftRingBuf[bin]*leftRingBuf[bin]+rightRingBuf[bin]*rightRingBuf[bin]);
-    if(v>second) second=v;
-  }
-  lastBeatHz=(float)bestK*MIC_FS/(float)CHIRP_SAMPLES;
-  float ratio=best/(second+DSP_EPS);
-  Serial.printf("[mic] mixFFT: rough=%.4f beat=%.3f Hz peak/runner-up=%.2f\n",lastRoughCorrelation,lastBeatHz,ratio);
-  return isfinite(best) && best>DSP_EPS && ratio>=DETECT_RATIO_THRESHOLD;
-}
+// static bool mixFFT() {
+//   float mean=(float)(leftRingSum/(double)CHIRP_SAMPLES);
+//   for(uint32_t n=0;n<CHIRP_SAMPLES;n++) {
+//     uint32_t at=(searchHead+n)%CHIRP_SAMPLES; float rx=leftRingBuf[at]-mean;
+//     rightRingBuf[n]=rx; if((n&4095u)==0) feedWatchdog();
+//   }
+//   for(uint32_t n=0;n<CHIRP_SAMPLES;n++){float rx=rightRingBuf[n];leftRingBuf[n]=rx*real_ref[n];rightRingBuf[n]=-rx*imag_ref[n];}
+//   fft32768(leftRingBuf,rightRingBuf);
+//   uint32_t maxBin=(uint32_t)(PEAK_SEARCH_MAX_HZ*CHIRP_SAMPLES/MIC_FS);
+//   float best=0.0f, second=0.0f; int32_t bestK=0;
+//   for(int32_t k=-(int32_t)maxBin;k<=(int32_t)maxBin;k++) {
+//     uint32_t bin=(uint32_t)((k+(int32_t)CHIRP_SAMPLES)%(int32_t)CHIRP_SAMPLES);
+//     float v=sqrtf(leftRingBuf[bin]*leftRingBuf[bin]+rightRingBuf[bin]*rightRingBuf[bin]);
+//     if(v>best){best=v;bestK=k;}
+//   }
+//   // Exclude the peak and its two adjacent bins from the competitor search;
+//   // otherwise spectral leakage from the same peak makes the ratio meaningless.
+//   for(int32_t k=-(int32_t)maxBin;k<=(int32_t)maxBin;k++) {
+//     if(abs(k-bestK)<=2) continue;
+//     uint32_t bin=(uint32_t)((k+(int32_t)CHIRP_SAMPLES)%(int32_t)CHIRP_SAMPLES);
+//     float v=sqrtf(leftRingBuf[bin]*leftRingBuf[bin]+rightRingBuf[bin]*rightRingBuf[bin]);
+//     if(v>second) second=v;
+//   }
+//   lastBeatHz=(float)bestK*MIC_FS/(float)CHIRP_SAMPLES;
+//   float ratio=best/(second+DSP_EPS);
+//   Serial.printf("[mic] mixFFT: rough=%.4f beat=%.3f Hz peak/runner-up=%.2f\n",lastRoughCorrelation,lastBeatHz,ratio);
+//   return isfinite(best) && best>DSP_EPS && ratio>=DETECT_RATIO_THRESHOLD;
+// }
 
 #define CHIRP_DIAG 1
 static constexpr int32_t DIAG_MAX_LAG = 512;
@@ -1246,21 +1301,12 @@ ctx->bearing = -1*angleDeg; // negate to turn toward the sound
   captureTdoaWindow();
   //if(!fineCorrelation()) return false;
 
-  bool fftValid = true ; // mixFFT();
+  bool fftValid = true ; // no need to run mixFFT();
 
   //Serial.printf("[mic] dechirp: 1\n");
   // Restart from a clean buffer after a candidate, regardless of FFT decision.
   if(micQueueRunning) { chirpQueueL.end(); chirpQueueR.end(); micQueueRunning=false; }
-  //Serial.printf("[mic] dechirp: 2\n");
-  // Correct way to flush a Teensy audio record queue
-  while (chirpQueueL.available() > 0) {
-      chirpQueueL.readBuffer(); // Consume the data pointer
-      chirpQueueL.freeBuffer(); // Release the block back to the audio memory pool
-  }
-  while (chirpQueueR.available() > 0) {
-      chirpQueueR.readBuffer();
-      chirpQueueR.freeBuffer();
-  }
+  micDrainQueues();
   //Serial.printf("[mic] dechirp: 3\n");
   searchHead=0; samplesInRing=0; samplesSinceSearch=0; leftRingSum=0.0;  leftRingSumSq=0.0;
   memset(leftRingBuf,0,sizeof(leftRingBuf)); memset(rightRingBuf,0,sizeof(rightRingBuf));
@@ -1268,32 +1314,71 @@ ctx->bearing = -1*angleDeg; // negate to turn toward the sound
   Serial.printf("[mic] dechirp: end fftValid=%d\n", fftValid);
   return fftValid;
 }
-static bool micTdoaSeconds(float& dt) {
-  // Search stereo cross-correlation within +/-100 samples (2.27 ms).
-  double best=-1.0; int bestLag=0;
-  for(int lag=-(int)FINE_XCORR_MAX_LAG;lag<=(int)FINE_XCORR_MAX_LAG;lag++) {
-    double acc=0.0,el=0.0,er=0.0;
-    for(int i=FINE_XCORR_MAX_LAG;i<(int)CAP_LEN-FINE_XCORR_MAX_LAG;i++) {
-      int j=i+lag; float l=g_capL[i],r=g_capR[j]; acc+=(double)l*r; el+=(double)l*l; er+=(double)r*r;
-    }
-    double score=fabs(acc)/(sqrt(el*er)+DSP_EPS);
-    if(score>best){best=score;bestLag=lag;}
-  }
-  // Positive dt means left channel leads right: a positive lag means right is
-  // best aligned by shifting its index later, so left arrived first.
-  dt=(float)bestLag/MIC_FS;
-  return isfinite(dt) && best>0.05;
+
+// static bool micTdoaSeconds(float& dt) {
+//   // Search stereo cross-correlation within +/-100 samples (2.27 ms).
+//   double best=-1.0; int bestLag=0;
+//   for(int lag=-(int)FINE_XCORR_MAX_LAG;lag<=(int)FINE_XCORR_MAX_LAG;lag++) {
+//     double acc=0.0,el=0.0,er=0.0;
+//     for(int i=FINE_XCORR_MAX_LAG;i<(int)CAP_LEN-FINE_XCORR_MAX_LAG;i++) {
+//       int j=i+lag; float l=g_capL[i],r=g_capR[j]; acc+=(double)l*r; el+=(double)l*l; er+=(double)r*r;
+//     }
+//     double score=fabs(acc)/(sqrt(el*er)+DSP_EPS);
+//     if(score>best){best=score;bestLag=lag;}
+//   }
+//   // Positive dt means left channel leads right: a positive lag means right is
+//   // best aligned by shifting its index later, so left arrived first.
+//   dt=(float)bestLag/MIC_FS;
+//   return isfinite(dt) && best>0.05;
+// }
+
+static void micStop() { 
+  if (micQueueRunning) { chirpQueueL.end(); chirpQueueR.end(); micQueueRunning=false; } 
+  micDrainQueues(); 
 }
 
-static void micStop() { if (micQueueRunning) { chirpQueueL.end(); chirpQueueR.end(); micQueueRunning=false; } while(chirpQueueL.available()) chirpQueueL.freeBuffer(); while(chirpQueueR.available()) chirpQueueR.freeBuffer(); }
+static volatile bool g_abortReq = false;
+static char    g_rxFifo[32];
+static uint8_t g_rxHead = 0, g_rxTail = 0;
 
+static void fifoPush(char c) {
+  uint8_t n = (g_rxHead + 1) % sizeof(g_rxFifo);
+  if (n != g_rxTail) { g_rxFifo[g_rxHead] = c; g_rxHead = n; }   // drop if full
+}
+static bool fifoPop(char& c) {
+  if (g_rxHead == g_rxTail) return false;
+  c = g_rxFifo[g_rxTail]; g_rxTail = (g_rxTail + 1) % sizeof(g_rxFifo);
+  return true;
+}
+
+// Call from every long blocking loop. Returns true once an abort key has been seen.
+static bool pollAbort() {
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == 'x' || c == 'X' || c == '!') g_abortReq = true;
+    fifoPush(c);                       // loop() still processes every character, including x
+  }
+  return g_abortReq;
+}
+
+static void checkRefMatchesTx() {
+  if (!spkChirpGenerated) spkGenerateChirp();
+  double dr = 0, di = 0, e1 = 0, er = 0, ei = 0;
+  for (uint32_t n = 0; n < CHIRP_SAMPLES; n++) {
+    double a = spkChirpBuffer[n] / 32768.0, r = real_ref[n], q = imag_ref[n];
+    dr += a*r; di += a*q; e1 += a*a; er += r*r; ei += q*q;
+  }
+  double cr = dr / sqrt(e1*er + 1e-30), ci = di / sqrt(e1*ei + 1e-30);
+  Serial.printf("[mic] corr(TX,real)=%.4f corr(TX,imag)=%.4f  analytic match=%.4f  phase offset=%.1f deg\n",
+                cr, ci, sqrt(cr*cr + ci*ci), atan2(ci, cr) * 57.29578);
+}
 
 class Mic : public Subsystem {
 public:
   enum Stage : uint8_t { WAITING, ROUGH, FFT, FINE };   // diagnostics only
   Stage stage() const { return stage_; }
 
-  void begin() { micBegin(); }
+  void begin() { micBegin(); checkRefMatchesTx(); }
 
   void start(const Step& s, Context* ctx) override {
     ctx_ = ctx;
@@ -1331,6 +1416,7 @@ private:
   
     while (!deadlinePassed()) {
       feedWatchdog();
+      if (pollAbort()) { micStop(); return Result::ABORTED; }
       stage_ = WAITING;
       if (!micGetStep()) continue;
       stage_ = ROUGH;  // Diagnostics: dechirp pipeline active
@@ -1348,6 +1434,7 @@ private:
     Result r = Result::TIMEOUT;
     while (!deadlinePassed()) {
       feedWatchdog();
+      if (pollAbort()) { afskStop(); return Result::ABORTED; }
       uint8_t cmd;
       if (afskDecodeFrame(cmd)) {
         Serial.printf("Received command ID: %u\n", cmd);
@@ -1843,9 +1930,7 @@ private:
 // Step = { prim, param, timeout_ms, onFail, gotoIdx }
 // ============================================================================
 #define ROBOT_ROLE 2       // change to 2 for the other robot
-
-//#if ROBOT_ROLE == ROBOT_B
-
+ 
 static const Step SEQ_TALK_CHIRP[] = {
   { Prim::SEND_CHIRP,      (float)CMD_LED_ON,  700, OnFail::ABORT, 0 },
   { Prim::WAIT,                            0, 5000, OnFail::ABORT, 0 },    
@@ -1879,69 +1964,15 @@ static const Step SEQ_TALK_AFSK[] = {
 
 
 
-static const Step SEQ__[] = {
-
-  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },    
-  { Prim::SEND_AFSK,      (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },    
-  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },    
-  { Prim::SEND_AFSK,      (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },    
-  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },    
-  { Prim::SEND_AFSK,      (float)CMD_LED_OFF, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },    
-
+static const Step SEQ_WAVE_TEST[] = {
+  { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },
   { Prim::PLAY_WAVE,          0,  5000, OnFail::ABORT, 0 }, // play yes and abort the seq if play gets timed out
-  { Prim::DRIVE,           1.0f,  4000, OnFail::ABORT, 0 },
   { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },
-  { Prim::TURN,            90,    3000, OnFail::ABORT, 0 },
+  { Prim::PLAY_WAVE,          1,  5000, OnFail::ABORT, 0 }, // play yes and abort the seq if play gets timed out
   { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },
 
-
-  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },    
-  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::WAIT,                            0, 2000, OnFail::ABORT, 0 },
-  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::WAIT,                            0, 3000, OnFail::ABORT, 0 },
-  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
-  { Prim::SEND_AFSK,       (float)CMD_LED_ON, 1500, OnFail::RETRY, 0 },  // 
- 
-
-  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
-  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
-  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
-  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
-  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
-  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
-  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
-  { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
 };
-// Robot A: hear chirp -> TDOA -> turn 90 -> hear chirp -> TDOA -> bearing ->
-//          face source -> drive 1 ft -> send AFSK "stop chirp"
-// static const Step SEQ[] = {
-//   { Prim::LISTEN_CHIRP,    0,    10000, OnFail::ABORT, 0 },   // 0
-//   { Prim::COMPUTE_TDOA,    1,      500, OnFail::ABORT, 0 },   // 1  -> theta1, heading1
-//   { Prim::TURN,            90,    3000, OnFail::ABORT, 0 },   // 2
-//   { Prim::WAIT,            0,      300, OnFail::ABORT, 0 },   // 3  settle (overlaps the superstructure settle)
-//   { Prim::LISTEN_CHIRP,    0,    10000, OnFail::ABORT, 0 },   // 4
-//   { Prim::COMPUTE_TDOA,    2,      500, OnFail::ABORT, 0 },   // 5  -> theta2, heading2
-//   { Prim::COMPUTE_BEARING, 0,       10, OnFail::ABORT, 0 },   // 6  -> bearing
-//   { Prim::TURN,            NAN,   3000, OnFail::ABORT, 0 },   // 7  NAN = use ctx.bearing
-//   { Prim::DRIVE,           1.0f,  4000, OnFail::ABORT, 0 },   // 8  feet
-//   { Prim::SEND_AFSK,       (float)CMD_STOP_CHIRP, 1500, OnFail::RETRY, 0 },  // 9
-// };
-//#else
+ 
 
 static const Step SEQ_LISTEN_CHIRP[] = {
  
@@ -1952,6 +1983,7 @@ static const Step SEQ_LISTEN_CHIRP[] = {
   { Prim::LCD1_ON,         0,  5000, OnFail::ABORT, 0 }, // play yes and abort the seq if play gets timed out
   { Prim::WAIT,            0,   1000, OnFail::ABORT, 0 },   // 3  settle (overlaps the superstructure settle)
   { Prim::TURN,            NAN,   3000, OnFail::ABORT, 0 },   // 7  NAN = use ctx.bearing
+  { Prim::LISTEN_CHIRP,    0,  100000, OnFail::ABORT, 0 },   // 4
 
 };
 
@@ -1971,13 +2003,7 @@ static const Step SEQ_LISTEN_AFSK[] = {
   { Prim::EXEC_RECEIVED_CMD, 0, 5000, OnFail::ABORT, 0 },
 
 };
-// Robot B: chirp 0.7 s, listen for AFSK 2.3 s; nothing heard -> repeat; heard -> do it, DONE
-// static const Step SEQ[] = {
-//   { Prim::SEND_CHIRP,        0,  700, OnFail::ABORT, 0 },     // 0  duration = 700 ms
-//   { Prim::LISTEN_AFSK,       0, 2300, OnFail::GOTO,  0 },     // 1  timeout -> back to step 0
-//   { Prim::EXEC_RECEIVED_CMD, 0, 5000, OnFail::ABORT, 0 },     // 2  then DONE
-// };
-//#endif
+ 
 
 // ============================================================================
 // MAIN
@@ -2013,14 +2039,25 @@ static bool userCharToStep(char ch, Step& out) {
 
 // A manual motion command preempts the autonomous sequence, then goes through
 // the Superstructure gate. Refused requests are retried by serviceUserCommands().
+static bool g_mtpMode = false;
+
 static void onUserCommand(char ch) {
+  if (g_mtpMode) {                                   // while in MTP mode, only these keys act
+    //if (ch == 'r' || ch == 'R') { MTP.send_DeviceResetEvent(); Serial.println("[mtp] reset event sent"); }
+    if (ch == 'q' || ch == 'Q') { Serial.println("[mtp] rebooting"); delay(100); SCB_AIRCR = 0x05FA0004; }
+    return;
+  }
   if (ch == '\r' || ch == '\n' || ch == ' ' || ch == '\t') return;
 
   if (ch == 'x' || ch == 'X' || ch == '!') {
+    g_abortReq = false;
     manualPending = false;
     manualInFlight = false;
-    seq.abort();  // invokes sup.emergencyStop(); chassis motors are commanded off
-    Serial.println("[user] EMERGENCY STOP: sequence aborted, motors commanded off");
+    seq.abort();                 // motors off, sequence FAILED
+    playWav1.stop();             // don't leave a WAV streaming from the SD card
+    micStop();                   // stop and clear the chirp queues
+    g_mtpMode = true;
+    Serial.println("[mtp] MTP mode: SD available to host. 'r' = refresh host view, 'q' = reboot");
     return;
   }
   Serial.printf("\n\n [user] command '%c' pressed  \n", ch);
@@ -2068,6 +2105,9 @@ static void serviceUserCommands() {
 void setup() {
   Serial.begin(115200);
 
+  MTP.begin();
+  MTP.addFilesystem(SD, "Teensy SD");
+
   Serial.println("--- BOOT / RESTART DETECTED ---");
   pinMode(LED_1, OUTPUT);
   digitalWrite(LED_1, LOW);
@@ -2077,13 +2117,15 @@ void setup() {
   sup.begin();                                     // init pins, gyro calibration, audio in/out
 
   #if ROBOT_ROLE == 1 
-  seq.load(SEQ_TALK_CHIRP, sizeof(SEQ_TALK_CHIRP) / sizeof(SEQ_TALK_CHIRP[0]), &ctx);
+    seq.load(SEQ_TALK_CHIRP, sizeof(SEQ_TALK_CHIRP) / sizeof(SEQ_TALK_CHIRP[0]), &ctx);
   #elif ROBOT_ROLE == 2
-  seq.load(SEQ_LISTEN_CHIRP, sizeof(SEQ_LISTEN_CHIRP) / sizeof(SEQ_LISTEN_CHIRP[0]), &ctx);
+    seq.load(SEQ_LISTEN_CHIRP, sizeof(SEQ_LISTEN_CHIRP) / sizeof(SEQ_LISTEN_CHIRP[0]), &ctx);
   #elif ROBOT_ROLE == 3
-  seq.load(SEQ_TALK_AFSK, sizeof(SEQ_TALK_AFSK) / sizeof(SEQ_TALK_AFSK[0]), &ctx);
+    seq.load(SEQ_TALK_AFSK, sizeof(SEQ_TALK_AFSK) / sizeof(SEQ_TALK_AFSK[0]), &ctx);
   #elif ROBOT_ROLE == 4
-  seq.load(SEQ_LISTEN_AFSK, sizeof(SEQ_LISTEN_AFSK) / sizeof(SEQ_LISTEN_AFSK[0]), &ctx);
+    seq.load(SEQ_LISTEN_AFSK, sizeof(SEQ_LISTEN_AFSK) / sizeof(SEQ_LISTEN_AFSK[0]), &ctx);
+  #elif ROBOT_ROLE == 5
+    seq.load(SEQ_WAVE_TEST, sizeof(SEQ_WAVE_TEST) / sizeof(SEQ_WAVE_TEST[0]), &ctx);
   #else
     #error "invalid"
 
@@ -2102,10 +2144,15 @@ void setup() {
 void loop() {
   feedWatchdog();
 
-  // 1) Read user input first so manual commands can preempt autonomous work.
-  while (Serial.available() > 0) {
-    onUserCommand((char)Serial.read());
-  }
+  // // 1) Read user input first so manual commands can preempt autonomous work.
+  // while (Serial.available() > 0) {
+  //   onUserCommand((char)Serial.read());
+  // }
+  pollAbort();                                   // Serial -> FIFO
+  char c;
+  while (fifoPop(c)) onUserCommand(c);
+
+  if (g_mtpMode) { MTP.loop(); return; } // need to be called continously (polled)
 
   // 2) Advance the currently active primitive / settling timer.
   sup.update();
