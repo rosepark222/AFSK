@@ -56,7 +56,7 @@ namespace cfg {
 
   // acoustics
   constexpr float SPEED_OF_SOUND_MPS = 343.0f;
-  constexpr float MIC_SPACING_M      = 0.15f;   // TODO: your mic baseline
+  constexpr float MIC_SPACING_M      = 0.21f;   // TODO: your mic baseline
   constexpr float BEARING_AGREE_DEG  = 30.0f;
 
   // audio library memory blocks (shared by everything that uses the Audio library).
@@ -1929,7 +1929,7 @@ private:
 // SEQUENCES erp029
 // Step = { prim, param, timeout_ms, onFail, gotoIdx }
 // ============================================================================
-#define ROBOT_ROLE 2       // change to 2 for the other robot
+#define ROBOT_ROLE 2    // change to 2 for the other robot
  
 static const Step SEQ_TALK_CHIRP[] = {
   { Prim::SEND_CHIRP,      (float)CMD_LED_ON,  700, OnFail::ABORT, 0 },
@@ -1983,7 +1983,7 @@ static const Step SEQ_LISTEN_CHIRP[] = {
   { Prim::LCD1_ON,         0,  5000, OnFail::ABORT, 0 }, // play yes and abort the seq if play gets timed out
   { Prim::WAIT,            0,   1000, OnFail::ABORT, 0 },   // 3  settle (overlaps the superstructure settle)
   { Prim::TURN,            NAN,   3000, OnFail::ABORT, 0 },   // 7  NAN = use ctx.bearing
-  { Prim::LISTEN_CHIRP,    0,  100000, OnFail::ABORT, 0 },   // 4
+//  { Prim::LISTEN_CHIRP,    0,  100000, OnFail::ABORT, 0 },   // 4
 
 };
 
