@@ -71,11 +71,13 @@ namespace cfg {
 // ================================ types ======================================
 enum class Prim : uint8_t {
   WAIT, LISTEN_CHIRP, COMPUTE_TDOA, COMPUTE_BEARING, TURN, DRIVE,
-  SEND_CHIRP, SEND_AFSK, LISTEN_AFSK, EXEC_RECEIVED_CMD, PLAY_WAVE, LCD1_ON, LCD1_OFF, COUNT
+  SEND_CHIRP, SEND_AFSK, LISTEN_AFSK, EXEC_RECEIVED_CMD, PLAY_WAVE, LCD1_ON, LCD1_OFF,
+  COMPUTE_DISTANCE, COUNT
 };
 static const char* PRIM_NAME[] = {
   "WAIT", "LISTEN_CHIRP", "COMPUTE_TDOA", "COMPUTE_BEARING", "TURN", "DRIVE",
-  "SEND_CHIRP", "SEND_AFSK", "LISTEN_AFSK", "EXEC_RECEIVED_CMD", "PLAY_WAVE", "LCD1_ON", "LCD_OFF"
+  "SEND_CHIRP", "SEND_AFSK", "LISTEN_AFSK", "EXEC_RECEIVED_CMD", "PLAY_WAVE", "LCD1_ON", "LCD_OFF",
+  "COMPUTE_DISTANCE"
 };
 
 enum class Result : uint8_t { RUNNING, SUCCESS, TIMEOUT, FAIL, REJECTED, ABORTED };
@@ -106,6 +108,16 @@ struct Context {         // "blackboard": data passed between steps
   float   bearing;             // world bearing to source (deg)
   uint8_t rxCmd;               // last decoded AFSK command
   uint8_t retries;
+
+  // Acoustic handshake timestamps. All are local micros() timestamps.
+  uint32_t bRescueStartUs = 0;       // B: first RESCUE playback block queued
+  uint32_t aFirstCrossRescueUs = 0;  // A: first rough-correlation crossing
+  uint32_t aReplyStartUs = 0;        // A: first REPLY playback block queued
+  uint32_t bFirstCrossReplyUs = 0;   // B: first rough-correlation crossing
+  uint32_t aPostprocessToReplyUs = 0;// B: configured calibration copied from A
+  float soundTravelTimeS = 0.0f;
+  float distanceMeters = 0.0f;
+  bool distanceValid = false;
 };
 
 static inline int idx(Owner o) { return (int)o; }
@@ -177,6 +189,19 @@ static constexpr uint32_t SPK_CHIRP_SAMPLES = 8u * 4096u;
 static constexpr float SPK_CHIRP_DURATION_S = (float)SPK_CHIRP_SAMPLES / SPK_CHIRP_SAMPLE_RATE;
 static constexpr uint32_t SPK_CHIRP_DURATION_MS =
     (SPK_CHIRP_SAMPLES * 1000u + SPK_CHIRP_SAMPLE_RATE - 1u) / SPK_CHIRP_SAMPLE_RATE;
+
+// Handshake tags carried in Step::param; the waveform itself is identical.
+static constexpr uint8_t CHIRP_TAG_SOS = 1;
+static constexpr uint8_t CHIRP_TAG_RESCUE = 2;
+static constexpr uint8_t CHIRP_TAG_REPLY = 3;
+static constexpr uint32_t CHIRP_DURATION_US =
+    (uint64_t)SPK_CHIRP_SAMPLES * 1000000ULL / SPK_CHIRP_SAMPLE_RATE;
+
+// Set this on Robot B to the A_postprocess_to_reply_us value printed by Robot A.
+// This calibration includes all processing from A's first RESCUE crossing until
+// A queues the first REPLY playback block. It is not measured remotely by B.
+static constexpr uint32_t A_POSTPROCESS_TO_REPLY_CAL_US = 0; // UPDATE after measuring Robot A
+
 static constexpr float SPK_CHIRP_F_START = 300.0f;
 static constexpr float SPK_CHIRP_F_END = 1500.0f;
 static constexpr uint8_t SPK_CHIRP_ID = 0;
@@ -241,7 +266,7 @@ static void spkBegin() {
 // itself is fixed at 32768 samples (~743 ms) to match the chirp detector reference.
 // This routine is intentionally synchronous, like spkStartAfsk(): queue backpressure
 // paces the copy at the audio sample rate while the Audio library plays the samples.
-static void spkStartChirp(uint32_t ms) {
+static void spkStartChirp(uint32_t ms, uint32_t* firstBlockQueuedUs = nullptr) {
   (void)ms;
   fskOsc.amplitude(0.0f);                 // never mix AFSK tones into the chirp
   if (!spkChirpGenerated) spkGenerateChirp();
@@ -258,6 +283,8 @@ static void spkStartChirp(uint32_t ms) {
       block[i] = (idx < SPK_CHIRP_SAMPLES) ? spkChirpBuffer[idx++] : 0;
     }
     chirpTxQueue.playBuffer();
+    if (idx == AUDIO_BLOCK_SAMPLES && firstBlockQueuedUs && *firstBlockQueuedUs == 0)
+      *firstBlockQueuedUs = micros(); // first playback block submitted to Audio library
   }
   // The final block has just been enqueued; Speaker::update() waits briefly for it
   // to drain before releasing the speaker subsystem.
@@ -337,9 +364,14 @@ public:
     return "B/yes.WAV"; 
   }
 
-  void start(const Step& s, Context*) override {
+  void start(const Step& s, Context* ctx) override {
     if (s.prim == Prim::SEND_CHIRP) {
-      spkStartChirp(s.timeout_ms);                 // fixed 32768-sample chirp
+      uint32_t* txStamp = nullptr;
+      const uint8_t tag = (uint8_t)s.param;
+      if (tag == CHIRP_TAG_RESCUE) txStamp = &ctx->bRescueStartUs;
+      else if (tag == CHIRP_TAG_REPLY) txStamp = &ctx->aReplyStartUs;
+      if (txStamp) *txStamp = 0;
+      spkStartChirp(s.timeout_ms, txStamp);                 // fixed 32768-sample chirp
       // spkStartChirp() blocks while feeding the queue. Allow the last audio block
       // to finish after it returns; don't truncate the ~743 ms reference chirp.
       endMs_ = millis() + 10u;
@@ -1231,6 +1263,7 @@ static bool    roughArmed  = false;
 static uint8_t roughCount  = 0;      // follow-up hops done
 static float   roughMax    = 0.0f;
 static uint8_t roughMaxIdx = 0;      // 0 = the first crossing, 1..5 = follow-up hops
+static uint8_t g_listenChirpTag = 0;
 
 static bool dechirp(Context* ctx) {
   if(!micDspReady || samplesInRing<CHIRP_SAMPLES || samplesSinceSearch<SEARCH_STEP_N) return false;
@@ -1239,11 +1272,14 @@ static bool dechirp(Context* ctx) {
   uint32_t start = ARM_DWT_CYCCNT;
   lastRoughCorrelation=roughCorrelation();
   uint32_t cycles = ARM_DWT_CYCCNT - start;
-  Serial.printf("roughCorrelation %.4f took %u cycles (870K cycles budget for hop-64 correlation)\n",lastRoughCorrelation, cycles);
+  // Serial.printf("roughCorrelation %.4f took %u cycles (870K cycles budget for hop-64 correlation)\n",lastRoughCorrelation, cycles);
 
   if(!roughArmed) {
     if(lastRoughCorrelation < ROUGH_SEARCH_THRESHOLD) return false;
     roughArmed  = true;                    // first crossing
+    const uint32_t firstCrossUs = micros();
+    if (g_listenChirpTag == CHIRP_TAG_RESCUE) ctx->aFirstCrossRescueUs = firstCrossUs;
+    else if (g_listenChirpTag == CHIRP_TAG_REPLY) ctx->bFirstCrossReplyUs = firstCrossUs;
     roughCount  = 0;
     roughMax    = lastRoughCorrelation;
     roughMaxIdx = 0;
@@ -1386,7 +1422,12 @@ public:
     deadlineMs_ = millis() + s.timeout_ms;
     stage_ = WAITING;
     switch (s.prim) {
-      case Prim::LISTEN_CHIRP: st_ = LISTEN_CHIRP; break;
+      case Prim::LISTEN_CHIRP:
+        st_ = LISTEN_CHIRP;
+        g_listenChirpTag = (uint8_t)s.param;
+        if (g_listenChirpTag == CHIRP_TAG_RESCUE) ctx_->aFirstCrossRescueUs = 0;
+        if (g_listenChirpTag == CHIRP_TAG_REPLY) ctx_->bFirstCrossReplyUs = 0;
+        break;
       case Prim::COMPUTE_TDOA: st_ = COMPUTE_TDOA; break;
       case Prim::LISTEN_AFSK:  st_ = LISTEN_AFSK;  break;
       default:                 st_ = IDLE;         break;
@@ -1412,6 +1453,7 @@ private:
   bool deadlinePassed() const { return (int32_t)(millis() - deadlineMs_) >= 0; }
 
   Result listenChirp() {
+    roughArmed = false; roughCount = 0; roughMax = 0.0f; roughMaxIdx = 0;
     micFlush();
   
     while (!deadlinePassed()) {
@@ -1750,6 +1792,10 @@ public:
         r = computeBearing(*ctx_) ? Result::SUCCESS : Result::FAIL;
         break;
 
+      case Prim::COMPUTE_DISTANCE:
+        r = computeDistance(*ctx_) ? Result::SUCCESS : Result::FAIL;
+        break;
+
       default: {                                   // subsystem-owned primitive
         uint32_t t0 = micros();
         r = sub_[idx(owner_)]->update();
@@ -1826,6 +1872,33 @@ private:
     if (s.prim == Prim::TURN && isnan(s.param))
       // s.param = wrap180(ctx->bearing - chassis_.yawDeg());   // relative turn to the world bearing
       s.param = wrap180(ctx->bearing);     // no gyro: bearing is the relative turn needed from the current pose
+    return true;
+  }
+
+  // B-side round-trip timing. The four timestamps are captured on B or A as
+  // described in Context; A's processing interval is supplied as a calibration.
+  bool computeDistance(Context& c) {
+    c.distanceValid = false;
+    if (!c.bRescueStartUs || !c.bFirstCrossReplyUs ||
+        A_POSTPROCESS_TO_REPLY_CAL_US == 0) {
+      Serial.println("[distance] missing timestamp or A_POSTPROCESS_TO_REPLY_CAL_US calibration");
+      return false;
+    }
+    const uint32_t elapsedUs = c.bFirstCrossReplyUs - c.bRescueStartUs; // wrap-safe unsigned delta
+    const int64_t correctedUs = (int64_t)elapsedUs -
+        (int64_t)A_POSTPROCESS_TO_REPLY_CAL_US - 2LL * (int64_t)CHIRP_DURATION_US;
+    if (correctedUs <= 0) {
+      Serial.printf("[distance] invalid corrected round trip: elapsed=%lu us, A_post=%lu us, chirp=%lu us\n",
+          (unsigned long)elapsedUs, (unsigned long)A_POSTPROCESS_TO_REPLY_CAL_US,
+          (unsigned long)CHIRP_DURATION_US);
+      return false;
+    }
+    c.soundTravelTimeS = 0.5f * (float)correctedUs * 1.0e-6f;
+    c.distanceMeters = cfg::SPEED_OF_SOUND_MPS * c.soundTravelTimeS;
+    c.distanceValid = true;
+    Serial.printf("[distance] elapsed=%.3f ms A_post=%.3f ms chirp=%.3f ms one_way=%.3f ms distance=%.3f m\n",
+        elapsedUs / 1000.0f, A_POSTPROCESS_TO_REPLY_CAL_US / 1000.0f,
+        CHIRP_DURATION_US / 1000.0f, c.soundTravelTimeS * 1000.0f, c.distanceMeters);
     return true;
   }
 
@@ -1929,21 +2002,21 @@ private:
 // SEQUENCES erp029
 // Step = { prim, param, timeout_ms, onFail, gotoIdx }
 // ============================================================================
-#define ROBOT_ROLE 2    // change to 2 for the other robot
+#define ROBOT_ROLE 2    // Robot A = 1, Robot B = 2
  
 static const Step SEQ_TALK_CHIRP[] = {
-  { Prim::SEND_CHIRP,      (float)CMD_LED_ON,  700, OnFail::ABORT, 0 },
-  { Prim::WAIT,                            0, 5000, OnFail::ABORT, 0 },    
-  { Prim::SEND_CHIRP,      (float)CMD_LED_OFF, 700, OnFail::RETRY, 0 },  // 
-  { Prim::WAIT,                            0, 5000, OnFail::ABORT, 0 },    
-  { Prim::SEND_CHIRP,      (float)CMD_LED_ON,  700, OnFail::ABORT, 0 },
-  { Prim::WAIT,                            0, 5000, OnFail::ABORT, 0 },    
-  { Prim::SEND_CHIRP,      (float)CMD_LED_OFF, 700, OnFail::RETRY, 0 },  // 
-  { Prim::WAIT,                            0, 5000, OnFail::ABORT, 0 }, 
-  { Prim::SEND_CHIRP,      (float)CMD_LED_ON,  700, OnFail::ABORT, 0 },
-  { Prim::WAIT,                            0, 5000, OnFail::ABORT, 0 },    
-  { Prim::SEND_CHIRP,      (float)CMD_LED_OFF, 700, OnFail::RETRY, 0 },  // 
-  { Prim::WAIT,                            0, 5000, OnFail::ABORT, 0 },    
+  // Robot A: SOS -> listen for RESCUE -> REPLY. Retry SOS if RESCUE times out.
+  { Prim::SEND_CHIRP,   (float)CHIRP_TAG_SOS,    1000, OnFail::ABORT, 0 },
+  { Prim::LISTEN_CHIRP, (float)CHIRP_TAG_RESCUE, 15000, OnFail::GOTO, 0 },
+  { Prim::SEND_CHIRP,   (float)CHIRP_TAG_REPLY,  1000, OnFail::ABORT, 0 },
+};
+
+static const Step SEQ_LISTEN_CHIRP[] = {
+  // Robot B: listen SOS -> send RESCUE -> listen REPLY -> calculate distance.
+  { Prim::LISTEN_CHIRP,    (float)CHIRP_TAG_SOS,    100000, OnFail::GOTO, 0 },
+  { Prim::SEND_CHIRP,      (float)CHIRP_TAG_RESCUE, 1000,   OnFail::ABORT, 0 },
+  { Prim::LISTEN_CHIRP,    (float)CHIRP_TAG_REPLY,  15000,  OnFail::GOTO, 0 },
+  { Prim::COMPUTE_DISTANCE, 0,                      1000,   OnFail::GOTO, 0 },
 };
 
 static const Step SEQ_TALK_AFSK[] = {
@@ -1974,18 +2047,6 @@ static const Step SEQ_WAVE_TEST[] = {
 };
  
 
-static const Step SEQ_LISTEN_CHIRP[] = {
- 
-  { Prim::LCD1_ON,         0,  5000, OnFail::ABORT, 0 }, // play yes and abort the seq if play gets timed out
-  { Prim::WAIT,            0,   1000, OnFail::ABORT, 0 },   // 3  settle (overlaps the superstructure settle)
-  { Prim::LCD1_OFF,        0,  5000, OnFail::ABORT, 0 }, // play yes and abort the seq if play gets timed out
-  { Prim::LISTEN_CHIRP,    0,  100000, OnFail::ABORT, 0 },   // 4
-  { Prim::LCD1_ON,         0,  5000, OnFail::ABORT, 0 }, // play yes and abort the seq if play gets timed out
-  { Prim::WAIT,            0,   1000, OnFail::ABORT, 0 },   // 3  settle (overlaps the superstructure settle)
-  { Prim::TURN,            NAN,   3000, OnFail::ABORT, 0 },   // 7  NAN = use ctx.bearing
-//  { Prim::LISTEN_CHIRP,    0,  100000, OnFail::ABORT, 0 },   // 4
-
-};
 
 static const Step SEQ_LISTEN_AFSK[] = {
   { Prim::LCD1_ON,         0,  5000, OnFail::ABORT, 0 }, // play yes and abort the seq if play gets timed out
@@ -2162,6 +2223,20 @@ void loop() {
 
   // 4) Advance the autonomous sequence. After manual takeover it stays FAILED.
   seq.update();
+
+  // Repeat the handshake continuously on either role after a completed exchange.
+  static bool reportedHandshake = false;
+  if (seq.state() == Sequencer::DONE && !reportedHandshake) {
+#if ROBOT_ROLE == 1
+    if (ctx.aFirstCrossRescueUs && ctx.aReplyStartUs) {
+      const uint32_t aPostUs = ctx.aReplyStartUs - ctx.aFirstCrossRescueUs;
+      Serial.printf("[handshake] A_postprocess_to_reply_us=%lu (copy this value to Robot B calibration)\n",
+                    (unsigned long)aPostUs);
+    }
+#endif
+    reportedHandshake = true;
+  }
+  if (seq.state() == Sequencer::DONE) { reportedHandshake = false; seq.start(); }
 
   // Other input sources should follow the same pattern: decode -> sup.request()
   // for work, or sup.emergencyStop() for an emergency.
