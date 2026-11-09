@@ -111,14 +111,36 @@ struct Context {         // "blackboard": data passed between steps
 
   // Acoustic handshake timestamps. All are local micros() timestamps.
   uint32_t bRescueStartUs = 0;       // B: first RESCUE playback block queued
-  uint32_t aFirstCrossRescueUs = 0;  // A: first rough-correlation crossing
-  uint32_t aReplyStartUs = 0;        // A: first REPLY playback block queued
-  uint32_t bFirstCrossReplyUs = 0;   // B: first rough-correlation crossing
-  uint32_t aPostprocessToReplyUs = 0;// B: configured calibration copied from A
+  uint32_t aFirstCrossDetectPingUs = 0;  // A: first rough-correlation crossing
+  uint32_t aPongStartUs = 0;        // A: first REPLY playback block queued
+  uint32_t bFirstCrossDetectPongUs = 0;   // B: first rough-correlation crossing
+  uint32_t aPostprocessToPongUs = 0;// B: configured calibration copied from A
   float soundTravelTimeS = 0.0f;
   float distanceMeters = 0.0f;
   bool distanceValid = false;
 };
+
+void printContext(const Context& ctx) {
+    Serial.println(F("--- Context Blackboard ---"));
+    Serial.print(F("theta1: ")); Serial.println(ctx.theta1);
+    Serial.print(F("theta2: ")); Serial.println(ctx.theta2);
+    Serial.print(F("heading1: ")); Serial.println(ctx.heading1);
+    Serial.print(F("heading2: ")); Serial.println(ctx.heading2);
+    Serial.print(F("bearing: ")); Serial.println(ctx.bearing);
+    Serial.print(F("rxCmd: ")); Serial.println(ctx.rxCmd);
+    Serial.print(F("retries: ")); Serial.println(ctx.retries);
+    
+    Serial.println(F("--- Timestamps & Acoustics ---"));
+    Serial.print(F("bRescueStartUs: ")); Serial.println(ctx.bRescueStartUs);
+    Serial.print(F("aFirstCrossDetectPingUs: ")); Serial.println(ctx.aFirstCrossDetectPingUs);
+    Serial.print(F("aPongStartUs: ")); Serial.println(ctx.aPongStartUs);
+    Serial.print(F("bFirstCrossDetectPongUs: ")); Serial.println(ctx.bFirstCrossDetectPongUs);
+    Serial.print(F("aPostprocessToPongUs: ")); Serial.println(ctx.aPostprocessToPongUs);
+    Serial.print(F("soundTravelTimeS: ")); Serial.println(ctx.soundTravelTimeS, 6); // Extra precision for floats
+    Serial.print(F("distanceMeters: ")); Serial.println(ctx.distanceMeters, 4);
+    Serial.print(F("distanceValid: ")); Serial.println(ctx.distanceValid ? "true" : "false");
+    Serial.println(F("--------------------------"));
+}
 
 static inline int idx(Owner o) { return (int)o; }
 
@@ -200,7 +222,7 @@ static constexpr uint32_t CHIRP_DURATION_US =
 // Set this on Robot B to the A_postprocess_to_reply_us value printed by Robot A.
 // This calibration includes all processing from A's first RESCUE crossing until
 // A queues the first REPLY playback block. It is not measured remotely by B.
-static constexpr uint32_t A_POSTPROCESS_TO_REPLY_CAL_US = 0; // UPDATE after measuring Robot A
+static constexpr uint32_t A_POSTPROCESS = 1032037; // 8383; // // UPDATE after measuring Robot A
 
 static constexpr float SPK_CHIRP_F_START = 300.0f;
 static constexpr float SPK_CHIRP_F_END = 1500.0f;
@@ -269,7 +291,8 @@ static void spkBegin() {
 static void spkStartChirp(uint32_t ms, uint32_t* firstBlockQueuedUs = nullptr) {
   (void)ms;
   fskOsc.amplitude(0.0f);                 // never mix AFSK tones into the chirp
-  if (!spkChirpGenerated) spkGenerateChirp();
+
+  if (!spkChirpGenerated) return; // spkGenerateChirp(); // do not do this 
 
   uint32_t idx = 0;
   while (idx < SPK_CHIRP_SAMPLES) {
@@ -364,12 +387,13 @@ public:
     return "B/yes.WAV"; 
   }
 
+// speaker starts
   void start(const Step& s, Context* ctx) override {
     if (s.prim == Prim::SEND_CHIRP) {
       uint32_t* txStamp = nullptr;
       const uint8_t tag = (uint8_t)s.param;
       if (tag == CHIRP_TAG_RESCUE) txStamp = &ctx->bRescueStartUs;
-      else if (tag == CHIRP_TAG_REPLY) txStamp = &ctx->aReplyStartUs;
+      else if (tag == CHIRP_TAG_REPLY) txStamp = &ctx->aPongStartUs;
       if (txStamp) *txStamp = 0;
       spkStartChirp(s.timeout_ms, txStamp);                 // fixed 32768-sample chirp
       // spkStartChirp() blocks while feeding the queue. Allow the last audio block
@@ -1211,6 +1235,8 @@ static void captureTdoaWindow() {
 // }
 
 #define CHIRP_DIAG 1
+
+
 static constexpr int32_t DIAG_MAX_LAG = 512;
 static double sumRing(const float* ring) {
   double s = 0;
@@ -1278,8 +1304,8 @@ static bool dechirp(Context* ctx) {
     if(lastRoughCorrelation < ROUGH_SEARCH_THRESHOLD) return false;
     roughArmed  = true;                    // first crossing
     const uint32_t firstCrossUs = micros();
-    if (g_listenChirpTag == CHIRP_TAG_RESCUE) ctx->aFirstCrossRescueUs = firstCrossUs;
-    else if (g_listenChirpTag == CHIRP_TAG_REPLY) ctx->bFirstCrossReplyUs = firstCrossUs;
+    if (g_listenChirpTag == CHIRP_TAG_RESCUE) ctx->aFirstCrossDetectPingUs = firstCrossUs;
+    else if (g_listenChirpTag == CHIRP_TAG_REPLY) ctx->bFirstCrossDetectPongUs = firstCrossUs;
     roughCount  = 0;
     roughMax    = lastRoughCorrelation;
     roughMaxIdx = 0;
@@ -1323,8 +1349,8 @@ arcsin = arcsin < -1.0 ? -1.0 : arcsin;
 arcsin = arcsin > 1.0 ? 1.0 : arcsin;
 float angleRad = asin(arcsin); 
 float angleDeg = angleRad * (180.0 / PI);
-for(int32_t i=0; i<=PROF_LAGS; i++)
-  Serial.printf("  %d, %.3f, %.3f\n", i, profL[i], profR[i]);
+// for(int32_t i=0; i<=PROF_LAGS; i++)
+//   Serial.printf("  %d, %.3f, %.3f\n", i, profL[i], profR[i]);
 Serial.printf("  lagL=%.3f, lagR=%.3f, dt=%.6f,  dd=%.3f, arcsin=%.3f, angleRad=%.3f, angleDeg=%.3f\n", 
                 lagL, lagR, dt, dd, arcsin, angleRad, angleDeg);
 
@@ -1425,8 +1451,8 @@ public:
       case Prim::LISTEN_CHIRP:
         st_ = LISTEN_CHIRP;
         g_listenChirpTag = (uint8_t)s.param;
-        if (g_listenChirpTag == CHIRP_TAG_RESCUE) ctx_->aFirstCrossRescueUs = 0;
-        if (g_listenChirpTag == CHIRP_TAG_REPLY) ctx_->bFirstCrossReplyUs = 0;
+        if (g_listenChirpTag == CHIRP_TAG_RESCUE) ctx_->aFirstCrossDetectPingUs = 0;
+        if (g_listenChirpTag == CHIRP_TAG_REPLY) ctx_->bFirstCrossDetectPongUs = 0;
         break;
       case Prim::COMPUTE_TDOA: st_ = COMPUTE_TDOA; break;
       case Prim::LISTEN_AFSK:  st_ = LISTEN_AFSK;  break;
@@ -1783,7 +1809,9 @@ public:
 
     switch (active_.prim) {
       case Prim::WAIT:                             // timeout_ms is the wait duration
-        r = ((int32_t)(now - (startMs_ + active_.timeout_ms)) >= 0) ? Result::SUCCESS : Result::RUNNING;
+        r = ((int32_t)(now - (startMs_ + active_.timeout_ms)) >= 0) ? 
+          (active_.param == -1 ? Result::FAIL : Result::SUCCESS) 
+          : Result::RUNNING;
         break;
       case Prim::LCD1_ON: digitalWrite(LED_1, HIGH);  r = Result::SUCCESS; break;
       case Prim::LCD1_OFF: digitalWrite(LED_1, LOW);  r = Result::SUCCESS; break;
@@ -1879,26 +1907,27 @@ private:
   // described in Context; A's processing interval is supplied as a calibration.
   bool computeDistance(Context& c) {
     c.distanceValid = false;
-    if (!c.bRescueStartUs || !c.bFirstCrossReplyUs ||
-        A_POSTPROCESS_TO_REPLY_CAL_US == 0) {
-      Serial.println("[distance] missing timestamp or A_POSTPROCESS_TO_REPLY_CAL_US calibration");
+    if (!c.bRescueStartUs || !c.bFirstCrossDetectPongUs ||
+        A_POSTPROCESS == 0) {
+      Serial.println("[distance] missing timestamp or A_POSTPROCESS calibration");
       return false;
     }
-    const uint32_t elapsedUs = c.bFirstCrossReplyUs - c.bRescueStartUs; // wrap-safe unsigned delta
-    const int64_t correctedUs = (int64_t)elapsedUs -
-        (int64_t)A_POSTPROCESS_TO_REPLY_CAL_US - 2LL * (int64_t)CHIRP_DURATION_US;
-    if (correctedUs <= 0) {
+    const uint32_t pingPongTimeUs = c.bFirstCrossDetectPongUs - c.bRescueStartUs; // wrap-safe unsigned delta
+    const int64_t soundTavelTimeUs = (int64_t)pingPongTimeUs - (int64_t)A_POSTPROCESS - 2LL * (int64_t)CHIRP_DURATION_US;
+    if (soundTavelTimeUs <= 0) {
       Serial.printf("[distance] invalid corrected round trip: elapsed=%lu us, A_post=%lu us, chirp=%lu us\n",
-          (unsigned long)elapsedUs, (unsigned long)A_POSTPROCESS_TO_REPLY_CAL_US,
+          (unsigned long)pingPongTimeUs, (unsigned long)A_POSTPROCESS,
           (unsigned long)CHIRP_DURATION_US);
       return false;
     }
-    c.soundTravelTimeS = 0.5f * (float)correctedUs * 1.0e-6f;
+    c.soundTravelTimeS = 0.5f * (float)soundTavelTimeUs * 1.0e-6f;
     c.distanceMeters = cfg::SPEED_OF_SOUND_MPS * c.soundTravelTimeS;
     c.distanceValid = true;
-    Serial.printf("[distance] elapsed=%.3f ms A_post=%.3f ms chirp=%.3f ms one_way=%.3f ms distance=%.3f m\n",
-        elapsedUs / 1000.0f, A_POSTPROCESS_TO_REPLY_CAL_US / 1000.0f,
+    Serial.printf("[distance] pingPongTimeUs = %.3f ms; soundTavelTimeUs = %.3f ms;  A_POSTPROCESS=%.3f ms; chirp=%.3f ms; c.soundTravelTimeS=%.3f ms; distance=%.3f m\n",
+        pingPongTimeUs / 1000.0f, soundTavelTimeUs / 1000.0f, A_POSTPROCESS / 1000.0f,
         CHIRP_DURATION_US / 1000.0f, c.soundTravelTimeS * 1000.0f, c.distanceMeters);
+//[distance] elapsed=2535.375 ms A_post=1032.037 ms chirp=743.038 ms one_way=8.631 ms distance=2.960 m
+    printContext(c);
     return true;
   }
 
@@ -2009,6 +2038,9 @@ static const Step SEQ_TALK_CHIRP[] = {
   { Prim::SEND_CHIRP,   (float)CHIRP_TAG_SOS,    1000, OnFail::ABORT, 0 },
   { Prim::LISTEN_CHIRP, (float)CHIRP_TAG_RESCUE, 15000, OnFail::GOTO, 0 },
   { Prim::SEND_CHIRP,   (float)CHIRP_TAG_REPLY,  1000, OnFail::ABORT, 0 },
+//  { Prim::WAIT, -1, 5000, OnFail::GOTO, 0 },  // param = -1 returns FAIL on timeout and GOTO step 0
+  { Prim::WAIT, 0, 5000, OnFail::GOTO, 0 },  // param = -1 returns FAIL on timeout and GOTO step 0
+
 };
 
 static const Step SEQ_LISTEN_CHIRP[] = {
@@ -2017,6 +2049,7 @@ static const Step SEQ_LISTEN_CHIRP[] = {
   { Prim::SEND_CHIRP,      (float)CHIRP_TAG_RESCUE, 1000,   OnFail::ABORT, 0 },
   { Prim::LISTEN_CHIRP,    (float)CHIRP_TAG_REPLY,  15000,  OnFail::GOTO, 0 },
   { Prim::COMPUTE_DISTANCE, 0,                      1000,   OnFail::GOTO, 0 },
+  { Prim::WAIT, -1, 5000, OnFail::GOTO, 0 }, 
 };
 
 static const Step SEQ_TALK_AFSK[] = {
@@ -2228,15 +2261,19 @@ void loop() {
   static bool reportedHandshake = false;
   if (seq.state() == Sequencer::DONE && !reportedHandshake) {
 #if ROBOT_ROLE == 1
-    if (ctx.aFirstCrossRescueUs && ctx.aReplyStartUs) {
-      const uint32_t aPostUs = ctx.aReplyStartUs - ctx.aFirstCrossRescueUs;
-      Serial.printf("[handshake] A_postprocess_to_reply_us=%lu (copy this value to Robot B calibration)\n",
-                    (unsigned long)aPostUs);
+    if (ctx.aFirstCrossDetectPingUs && ctx.aPongStartUs) {
+      const uint32_t aPostUs = ctx.aPongStartUs - ctx.aFirstCrossDetectPingUs;
+      Serial.printf("[handshake] A_POSTPROCESS=%lu (copy this value to Robot B calibration) ctx.aFirstCrossDetectPingUs=%lu  ctx.aPongStartUs=%lu \n",
+                    (unsigned long)aPostUs,
+                    ctx.aFirstCrossDetectPingUs,
+                    ctx.aPongStartUs);
+
     }
 #endif
     reportedHandshake = true;
   }
-  if (seq.state() == Sequencer::DONE) { reportedHandshake = false; seq.start(); }
+  // if sequencer done, go to step 0
+   if (seq.state() == Sequencer::DONE) { reportedHandshake = false; seq.start(); }
 
   // Other input sources should follow the same pattern: decode -> sup.request()
   // for work, or sup.emergencyStop() for an emergency.
