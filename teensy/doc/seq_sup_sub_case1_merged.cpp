@@ -1,5 +1,7 @@
- 
 #include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 #include <Audio.h>
 #include <SD.h>
 #include <MTP_Teensy.h>
@@ -19,6 +21,9 @@
 
 
 
+#define LOG_STATS 1   // print every primitive's result + timing from Superstructure::finish()
+#define TURN_DEBUG 1  // print yaw/target/error/rate every 50 ms during a gyro turn
+
 // ============================ configuration ==================================
 namespace cfg {
   // motor driver pins (PWM + DIR style). TODO: match your wiring.
@@ -32,13 +37,25 @@ namespace cfg {
   constexpr uint32_t GYRO_PERIOD_US = 2000;     // read gyro at 500 Hz
   constexpr uint32_t GYRO_MAX_DT_US = 20000;    // longer gap (e.g. mic DSP ran): don't integrate
 
+  // gyro hardware (MPU6050 on Wire: SDA = pin 18, SCL = pin 19 on Teensy 4.x)
+  constexpr uint8_t  MPU_ADDR         = 0x68;
+  constexpr float    GYRO_SIGN        = 1.0f;   // set to -1.0f if left turns read negative
+  constexpr float    GYRO_LSB_PER_DPS = 65.5f;  // for MPU6050_RANGE_500_DEG
+  constexpr uint32_t GYRO_STALE_MS    = 100;    // no good read for this long mid-turn -> FAIL
+  constexpr float    GYRO_STILL_DEADBAND_DPS = 0.15f; // ignore noise while stopped
+
   // gyro-closed-loop turn
-  constexpr float   TURN_KP          = 3.0f;    // PWM counts per degree of error
-  constexpr int     TURN_PWM_MAX     = 200;
-  constexpr int     TURN_PWM_MIN     = 70;      // overcome stiction
-  constexpr float   TURN_TOL_DEG     = 2.0f;
+  // Motors have a dead zone (no motion at PWM 137, ~90 dps at 200), so the turn uses
+  // full power far away, a predicted-coast cutoff, and short min-PWM pulses near the target.
+  constexpr int     TURN_PWM_MAX     = 200;     // cruise PWM while far from target
+  constexpr int     TURN_PWM_MIN     = 160;     // MEASURE: lowest PWM that reliably moves the robot
+  constexpr float   TURN_COAST_S     = 0.08f;   // coast time: cut power when err < rate * this
+  constexpr float   TURN_CREEP_DEG   = 12.0f;   // inside this error, use pulses instead of cruise
+  constexpr uint32_t TURN_PULSE_ON_MS     = 40; // creep pulse length
+  constexpr uint32_t TURN_PULSE_PERIOD_MS = 150;// creep pulse period (off time = period - on)
+  constexpr float   TURN_TOL_DEG     = 3.0f;
   constexpr float   TURN_RATE_OK_DPS = 5.0f;    // must be nearly still to finish
-  constexpr uint8_t TURN_HOLD_TICKS  = 20;      // consecutive loop passes in tolerance and still
+  constexpr uint32_t TURN_HOLD_MS    = 120;     // in tolerance AND still for this long
 
   // timer fallback if gyro is dead (calibrate on your floor + battery)
   constexpr int     OPENLOOP_TURN_PWM = 200;
@@ -48,6 +65,7 @@ namespace cfg {
   constexpr int     DRIVE_PWM      = 200;
   constexpr float   DRIVE_FT_PER_S = 1.0f;      // calibrate
   constexpr float   HOLD_KP        = 2.0f;
+  constexpr float   HOLD_CORR_MAX  = 60.0f;     // PWM counts
 
   // settle (quiet) time after a subsystem releases the floor
   constexpr uint32_t SETTLE_CHASSIS_MS = 300;   // motor noise + vibration
@@ -1523,13 +1541,46 @@ private:
 };
 
 // ============================================================================
+// GYRO DRIVER  (MPU6050, Z axis only)
+// Teensy 4.x default I2C = Wire on pin 18 (SDA) / 19 (SCL). Pins 16/17 are Wire1,
+// so don't wire the gyro there (they're your IN3/IN4).
+// ============================================================================
+static Adafruit_MPU6050 g_mpu;
+static bool g_mpuPresent = false;
+
+static bool gyroHwInit() {
+  Wire.begin();
+  Wire.setClock(400000);
+  if (!g_mpu.begin(cfg::MPU_ADDR, &Wire)) {
+    Serial.println("[gyro] MPU6050 not detected");
+    return false;
+  }
+  g_mpu.setAccelerometerRange(MPU6050_RANGE_8_G);   // unused, same as your test
+  g_mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  g_mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  Serial.println("[gyro] MPU6050 connected");
+  return true;
+}
+
+// Returns true + deg/s (CCW positive) on success. Reads only GYRO_ZOUT (0x47/0x48).
+static bool readGyroZ_dps(float& dps) {
+  if (!g_mpuPresent) return false;
+  Wire.beginTransmission(cfg::MPU_ADDR);
+  Wire.write((uint8_t)0x47);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((uint8_t)cfg::MPU_ADDR, (uint8_t)2) != 2) return false;
+  uint8_t hi = Wire.read();                 // separate statements: evaluation order matters
+  uint8_t lo = Wire.read();
+  int16_t raw = (int16_t)(((uint16_t)hi << 8) | lo);
+  dps = cfg::GYRO_SIGN * (float)raw / cfg::GYRO_LSB_PER_DPS;
+  return true;
+}
+
+// ============================================================================
 // CHASSIS subsystem   (TURN, DRIVE)
 // Yaw convention: degrees, CCW (left) positive, wrapped to (-180, 180].
 // Non-blocking: update() is called every loop pass and does one control step.
 // ============================================================================
-// TODO: replace with your gyro driver. Return true + deg/s (CCW positive) on success.
-static bool readGyroZ_dps(float& dps) { return false; }
-
 class Chassis : public Subsystem {
 public:
   void begin() {
@@ -1539,22 +1590,39 @@ public:
     analogWriteFrequency(cfg::ENB, 20000);
     setMotors(0, 0);
 
+    g_mpuPresent = gyroHwInit();
+
     // Gyro bias calibration: robot must be still for ~0.5 s at boot.
-    float sum = 0, v; int n = 0;
-    for (int i = 0; i < 500; i++) { if (readGyroZ_dps(v)) { sum += v; n++; } delay(1); }
+    double sum = 0, sumSq = 0; int n = 0; float v;
+    if (g_mpuPresent) {
+      for (int i = 0; i < 500; i++) {
+        if (readGyroZ_dps(v)) { sum += v; sumSq += (double)v * v; n++; }
+        delay(1);
+      }
+    }
     gyroOk_ = (n > 400);
-    bias_   = gyroOk_ ? sum / n : 0;
-    yaw_    = 0;
-    lastUs_ = micros();
+    bias_   = gyroOk_ ? (float)(sum / n) : 0.0f;
+    if (gyroOk_) {
+      float var = (float)(sumSq / n - (sum / n) * (sum / n));
+      float sd  = sqrtf(var > 0 ? var : 0);
+      Serial.printf("[gyro] bias=%.3f dps, noise sd=%.3f dps (%d samples)\n", bias_, sd, n);
+      if (sd > 1.0f) Serial.println("[gyro] WARNING: robot moved during calibration; reboot while still");
+    } else {
+      Serial.println("[gyro] calibration failed -> using timer fallback for turns");
+    }
+    yaw_        = 0;
+    rate_       = 0;
+    lastUs_     = micros();
+    lastGoodMs_ = millis();
   }
 
   // Called every loop pass (rate-limited inside). A sensor, not an "active" subsystem.
   void tickHeading() {
+    if (!g_mpuPresent) return;
     uint32_t nowUs = micros();
     uint32_t dtUs  = nowUs - lastUs_;
     if (dtUs < cfg::GYRO_PERIOD_US) return;
     lastUs_ = nowUs;
-    if (dtUs > cfg::GYRO_MAX_DT_US) return;        // long gap: skip rather than integrate
 
     float raw;
     if (!readGyroZ_dps(raw)) {
@@ -1562,19 +1630,30 @@ public:
       return;
     }
     badReads_ = 0; gyroOk_ = true;
+    lastGoodMs_ = millis();
+
+    // Long gap (e.g. mic DSP / blocking TX ran): we still refreshed the reading above,
+    // but dt is meaningless, so don't integrate it.
+    if (dtUs > cfg::GYRO_MAX_DT_US) return;
 
     if (mode_ == STOPPED && fabsf(raw - bias_) < 1.0f)   // slow bias tracking while still
       bias_ += 0.001f * (raw - bias_);
 
     rate_ = raw - bias_;
-    yaw_  = wrap180(yaw_ + rate_ * (dtUs * 1e-6f));
+    if (mode_ == STOPPED && fabsf(rate_) < cfg::GYRO_STILL_DEADBAND_DPS) {
+      rate_ = 0;                                    // don't let noise walk the yaw while parked
+      return;
+    }
+    yaw_ = wrap180(yaw_ + rate_ * (dtUs * 1e-6f));
   }
 
-  float yawDeg() const { return yaw_; }
+  float yawDeg()   const { return yaw_; }
+  float rateDps()  const { return rate_; }
+  bool  gyroGood() const { return gyroOk_; }
 
   void start(const Step& s, Context*) override {
     uint32_t now = millis();
-    holdTicks_ = 0;
+    holding_ = false;
     if (s.prim == Prim::TURN) {
       float deg = wrap180(s.param);                // + = left, - = right
       useGyro_ = gyroOk_;
@@ -1586,6 +1665,9 @@ public:
         endMs_ = now + (uint32_t)(fabsf(deg) / cfg::OPENLOOP_TURN_DPS * 1000.0f);
       }
       mode_ = TURNING;
+      lastDbgMs_ = 0;
+      Serial.printf("[chassis] TURN start deg=%.1f useGyro=%d gyroOk=%d yaw=%.1f target=%.1f\n",
+                    deg, (int)useGyro_, (int)gyroOk_, yaw_, targetYaw_);
     } else {                                       // DRIVE, param = feet
       holdYaw_ = yaw_;
       endMs_   = now + (uint32_t)(s.param / cfg::DRIVE_FT_PER_S * 1000.0f);
@@ -1602,7 +1684,13 @@ public:
     }
   }
 
-  void abort() override        { forceIdle(); }
+  void abort() override {
+    if (mode_ != STOPPED)
+      Serial.printf("[chassis] abort (timeout/fail) while %s: yaw=%.1f tgt=%.1f err=%.1f rate=%.1f gyroOk=%d useGyro=%d\n",
+                    mode_ == TURNING ? "TURNING" : "DRIVING", yaw_, targetYaw_,
+                    wrap180(targetYaw_ - yaw_), rate_, (int)gyroOk_, (int)useGyro_);
+    forceIdle();
+  }
   bool isIdle() const override { return mode_ == STOPPED; }
   void forceIdle() override    { setMotors(0, 0); mode_ = STOPPED; }
 
@@ -1622,29 +1710,65 @@ private:
       return Result::RUNNING;
     }
 
+    // Gyro went stale mid-turn: stop rather than spin blind.
+    if ((now - lastGoodMs_) > cfg::GYRO_STALE_MS) {
+      setMotors(0, 0);
+      mode_ = STOPPED;
+      Serial.println("[chassis] gyro stale during turn -> FAIL");
+      return Result::FAIL;
+    }
+
     float err   = wrap180(targetYaw_ - yaw_);      // + = still need to turn left
     bool  inTol = fabsf(err) < cfg::TURN_TOL_DEG;
     bool  still = fabsf(rate_) < cfg::TURN_RATE_OK_DPS;
 
+#if TURN_DEBUG
+    if ((now - lastDbgMs_) >= 50) {
+      lastDbgMs_ = now;
+      Serial.printf("[turn] t=%lu yaw=%.1f tgt=%.1f err=%.1f rate=%.1f cmd=%.0f inTol=%d still=%d\n",
+                    (unsigned long)now, yaw_, targetYaw_, err, rate_, lastCmd_, (int)inTol, (int)still);
+    }
+#endif
+
     if (inTol) {
       setMotors(0, 0);
-      if (still && ++holdTicks_ >= cfg::TURN_HOLD_TICKS) { mode_ = STOPPED; return Result::SUCCESS; }
-      if (!still) holdTicks_ = 0;
+      if (still) {
+        if (!holding_) { holding_ = true; holdStartMs_ = now; }
+        if ((now - holdStartMs_) >= cfg::TURN_HOLD_MS) {
+          mode_ = STOPPED;
+          return Result::SUCCESS;
+        }
+      } else {
+        holding_ = false;
+      }
       return Result::RUNNING;
     }
 
-    holdTicks_ = 0;
-    float cmd = cfg::TURN_KP * err;                // P control, slows near the target
-    if (cmd >  cfg::TURN_PWM_MAX) cmd =  cfg::TURN_PWM_MAX;
-    if (cmd < -cfg::TURN_PWM_MAX) cmd = -cfg::TURN_PWM_MAX;
-    if (fabsf(cmd) < cfg::TURN_PWM_MIN) cmd = copysignf(cfg::TURN_PWM_MIN, err);
+    holding_ = false;
+    const float dir = (err > 0) ? 1.0f : -1.0f;
+    float cmd = 0.0f;
+    // Where would we end up if power were cut now? A sign flip means we would overshoot.
+    const float remaining = err - cfg::TURN_COAST_S * rate_;
+    if (remaining * err <= 0.0f) {
+      cmd = 0.0f;                                  // coast to a stop
+    } else if (fabsf(err) > cfg::TURN_CREEP_DEG) {
+      cmd = dir * cfg::TURN_PWM_MAX;               // cruise
+    } else {                                       // creep: short pulses at minimum moving PWM
+      cmd = ((now % cfg::TURN_PULSE_PERIOD_MS) < cfg::TURN_PULSE_ON_MS) ? dir * cfg::TURN_PWM_MIN : 0.0f;
+    }
+    lastCmd_ = cmd;
     setMotors(-(int)cmd, +(int)cmd);               // err>0: left wheel back, right forward
-    return Result::RUNNING;                        // overshoot fixes itself: err flips sign
+    return Result::RUNNING;
   }
 
   Result updateDrive(uint32_t now) {
     if ((int32_t)(now - endMs_) >= 0) { setMotors(0, 0); mode_ = STOPPED; return Result::SUCCESS; }
-    float corr = gyroOk_ ? cfg::HOLD_KP * wrap180(holdYaw_ - yaw_) : 0.0f;   // + = veer left
+    float corr = 0.0f;
+    if (gyroOk_) {
+      corr = cfg::HOLD_KP * wrap180(holdYaw_ - yaw_);       // + = veer left
+      if (corr >  cfg::HOLD_CORR_MAX) corr =  cfg::HOLD_CORR_MAX;
+      if (corr < -cfg::HOLD_CORR_MAX) corr = -cfg::HOLD_CORR_MAX;
+    }
     setMotors((int)(cfg::DRIVE_PWM - corr), (int)(cfg::DRIVE_PWM + corr));
     return Result::RUNNING;
   }
@@ -1655,7 +1779,7 @@ private:
       if (v >  255) v =  255;
       if (v < -255) v = -255;
       analogWrite(pwmPin, abs(v));
-      if (v >= 0) { // foward
+      if (v >= 0) { // forward
         digitalWrite(fwdPin, LOW);
         digitalWrite(revPin, HIGH);
       } else { // reverse
@@ -1667,17 +1791,19 @@ private:
     drive(cfg::ENA, cfg::IN1, cfg::IN2, left);
     drive(cfg::ENB, cfg::IN3, cfg::IN4, right);
   }
- 
 
   Mode     mode_ = STOPPED;
   float    yaw_ = 0, bias_ = 0, rate_ = 0;
-  uint32_t lastUs_ = 0;
+  uint32_t lastUs_ = 0, lastGoodMs_ = 0;
   uint8_t  badReads_ = 0;
   bool     gyroOk_ = false;
   bool     useGyro_ = false;
   float    targetYaw_ = 0, pendingDeg_ = 0, holdYaw_ = 0;
   int8_t   openLoopDir_ = 1;
-  uint8_t  holdTicks_ = 0;
+  bool     holding_ = false;
+  uint32_t holdStartMs_ = 0;
+  uint32_t lastDbgMs_ = 0;
+  float    lastCmd_ = 0;
   uint32_t endMs_ = 0;
 };
 
@@ -1749,6 +1875,9 @@ public:
     sub_[idx(Owner::CHASSIS)] = &chassis_;
     speaker_.begin(); mic_.begin(); chassis_.begin();
   }
+
+  // Current gyro yaw (deg, CCW +) for debugging.
+  float yawDeg() const { return chassis_.yawDeg(); }
 
   // ---------------------------------------------------------------------------
   // request(): the ONLY way to start work. false = "not now, ask again".
@@ -1899,7 +2028,7 @@ private:
     }
     if (s.prim == Prim::TURN && isnan(s.param))
       // s.param = wrap180(ctx->bearing - chassis_.yawDeg());   // relative turn to the world bearing
-      s.param = wrap180(ctx->bearing);     // no gyro: bearing is the relative turn needed from the current pose
+      s.param = wrap180(ctx->bearing);     // bearing is the relative turn needed from the current pose
     return true;
   }
 
@@ -1989,6 +2118,7 @@ public:
         Result r = sup_.takeResult();
         if (r == Result::RUNNING) break;
         if (r == Result::SUCCESS) { advance(); break; }
+        Serial.printf("[seq] step %u %s -> %s\n", i_, PRIM_NAME[(int)steps_[i_].prim], RESULT_NAME[(int)r]);
         if (r == Result::ABORTED) { state_ = FAILED; break; }
 
         const Step& s = steps_[i_];                          // TIMEOUT / FAIL: apply the step's policy
@@ -2031,8 +2161,15 @@ private:
 // SEQUENCES erp029
 // Step = { prim, param, timeout_ms, onFail, gotoIdx }
 // ============================================================================
-#define ROBOT_ROLE 2    // Robot A = 1, Robot B = 2
- 
+#define ROBOT_ROLE 6    // Robot A = 1, Robot B = 2
+
+// ROLE6
+static const Step SEQ_GYRO_TEST[] = {
+  { Prim::PLAY_WAVE,          0,  5000, OnFail::ABORT, 0 },
+  { Prim::TURN, 45.0f, 3000, OnFail::ABORT, 0 },
+  { Prim::PLAY_WAVE,          0,  5000, OnFail::ABORT, 0 },
+};
+
 static const Step SEQ_TALK_CHIRP[] = {
   // Robot A: SOS -> listen for RESCUE -> REPLY. Retry SOS if RESCUE times out.
   { Prim::SEND_CHIRP,   (float)CHIRP_TAG_SOS,    1000, OnFail::ABORT, 0 },
@@ -2154,11 +2291,15 @@ static void onUserCommand(char ch) {
     Serial.println("[mtp] MTP mode: SD available to host. 'r' = refresh host view, 'q' = reboot");
     return;
   }
+
+  // 'g' = print current gyro yaw (for sign / scale checks)
+  if (ch == 'g' || ch == 'G') { Serial.printf("[gyro] yaw=%.2f deg\n", sup.yawDeg()); return; }
+
   Serial.printf("\n\n [user] command '%c' pressed  \n", ch);
   Step requested{};
   if (!userCharToStep(ch, requested)) {
     if (ch == '?' || ch == 'h' || ch == 'H') {
-      Serial.println("Commands: t=turn left 90 deg, d=drive forward 1 ft, x=emergency stop, ?=help");
+      Serial.println("Commands: t=turn left 90 deg, d=drive forward 1 ft, g=print gyro yaw, x=emergency stop, ?=help");
     } else {
       Serial.printf("[user] Unknown command '%c'. Type ? for help.\n", ch);
     }
@@ -2220,6 +2361,8 @@ void setup() {
     seq.load(SEQ_LISTEN_AFSK, sizeof(SEQ_LISTEN_AFSK) / sizeof(SEQ_LISTEN_AFSK[0]), &ctx);
   #elif ROBOT_ROLE == 5
     seq.load(SEQ_WAVE_TEST, sizeof(SEQ_WAVE_TEST) / sizeof(SEQ_WAVE_TEST[0]), &ctx);
+ #elif ROBOT_ROLE == 6
+    seq.load(SEQ_GYRO_TEST, sizeof(SEQ_GYRO_TEST) / sizeof(SEQ_GYRO_TEST[0]), &ctx);
   #else
     #error "invalid"
 
@@ -2232,7 +2375,7 @@ void setup() {
 #endif
 
   seq.start();
-  Serial.println("Robot ready. Serial commands: t=left 90 deg, d=forward 1 ft, x=stop, ?=help");
+  Serial.println("Robot ready. Serial commands: t=left 90 deg, d=forward 1 ft, g=gyro yaw, x=stop, ?=help");
 }
 
 void loop() {
